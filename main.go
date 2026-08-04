@@ -6,534 +6,897 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/asn1"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/textproto"
 	"os"
 	"os/exec"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
+)
+
+const (
+	defaultCommandTimeout = 30 * time.Second
+	defaultMaxBodyBytes   = int64(64 << 20)
+	defaultMaxOutputBytes = int64(64 << 20)
+	readHeaderTimeout     = 10 * time.Second
+	shutdownTimeout       = 5 * time.Second
 )
 
 /////////////////////////////////////////////////////////////////////////////
 // options
 //
-type Config struct {
-	Addr string
+type config struct {
+	addr string
 
-	Cert       string
-	Key        string
-	VerifyPeer bool
-	CAFile     string
-	CommonName string
+	cert       string
+	key        string
+	verifyPeer bool
+	caFile     string
+	commonName string
 
-	Command string
-	Args    []string
+	command string
+	args    []string
 
-	Timeout time.Duration
+	timeout        time.Duration
+	maxBodyBytes   int64
+	maxOutputBytes int64
 }
 
-func parseArgs(args []string) (*Config, error) {
+func parseArgs(args []string) (*config, error) {
 	if len(args) < 2 {
-		return nil, fmt.Errorf("usage: httpcat listen:addr[,options] exec:\"command\"")
+		return nil, errors.New("usage: httpcat listen:addr[,cert=file,key=file,verify[=bool],cafile=file,commonname=name,timeout=30s,maxbody=bytes,maxoutput=bytes] exec:\"command [args...]\"")
 	}
 
-	cfg := &Config{Timeout: 30 * time.Second}
+	cfg := &config{
+		timeout:        defaultCommandTimeout,
+		maxBodyBytes:   defaultMaxBodyBytes,
+		maxOutputBytes: defaultMaxOutputBytes,
+	}
+	seenListen := false
+	seenExec := false
 
 	for _, arg := range args {
 		switch {
 		case strings.HasPrefix(arg, "listen:"):
+			if seenListen {
+				return nil, errors.New("listen may only be specified once")
+			}
+			seenListen = true
 			if err := parseListen(cfg, strings.TrimPrefix(arg, "listen:")); err != nil {
-				return nil, err
+				return nil, fmt.Errorf("invalid listen specification: %w", err)
 			}
 
 		case strings.HasPrefix(arg, "exec:"):
-			cmd := strings.TrimPrefix(arg, "exec:")
-			cmd = strings.TrimSpace(cmd)
-			cmd = trimQuote(cmd)
-			parts := splitCommand(cmd)
-			if len(parts) == 0 {
-				return nil, fmt.Errorf("empty command")
+			if seenExec {
+				return nil, errors.New("exec may only be specified once")
 			}
-			cfg.Command = parts[0]
-			cfg.Args = parts[1:]
+			seenExec = true
+			parts, err := splitCommand(strings.TrimSpace(strings.TrimPrefix(arg, "exec:")))
+			if err != nil {
+				return nil, fmt.Errorf("invalid exec specification: %w", err)
+			}
+			if len(parts) == 0 || parts[0] == "" {
+				return nil, errors.New("exec command must not be empty")
+			}
+			cfg.command = parts[0]
+			cfg.args = parts[1:]
 
 		default:
-			return nil, fmt.Errorf("unknown argument: %s", arg)
+			return nil, fmt.Errorf("unknown argument: %q", arg)
 		}
 	}
 
-	if cfg.Addr == "" {
-		return nil, fmt.Errorf("listen is required")
+	if !seenListen {
+		return nil, errors.New("listen is required")
 	}
-
-	if cfg.Command == "" {
-		return nil, fmt.Errorf("exec is required")
+	if !seenExec {
+		return nil, errors.New("exec is required")
 	}
 
 	return cfg, nil
 }
 
-func parseListen(cfg *Config, spec string) error {
-	parts := splitCommaOptions(spec)
-	if len(parts) == 0 {
-		return fmt.Errorf("empty listen spec")
+func parseListen(cfg *config, spec string) error {
+	parts, err := splitQuotedList(spec, ',')
+	if err != nil {
+		return err
 	}
-	addr := parts[0]
-
-	switch {
-	case strings.HasPrefix(addr, ":"):
-		cfg.Addr = addr
-
-	case strings.HasPrefix(addr, "["):
-		// IPv6: [::1]:8080
-		cfg.Addr = addr
-
-	case strings.Contains(addr, ":"):
-		// host:port
-		cfg.Addr = addr
-
-	default:
-		// port only
-		if _, err := strconv.Atoi(addr); err != nil {
-			return fmt.Errorf("invalid port: %s", addr)
-		}
-		cfg.Addr = ":" + addr
+	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
+		return errors.New("listen address must not be empty")
 	}
 
-	for _, opt := range parts[1:] {
-		var key, value string
-		pair := strings.SplitN(opt, "=", 2)
-		key = pair[0]
-		if len(pair) == 2 {
-			value = pair[1]
+	cfg.addr, err = normalizeListenAddress(strings.TrimSpace(parts[0]))
+	if err != nil {
+		return err
+	}
+
+	seenOptions := make(map[string]struct{}, len(parts)-1)
+	for _, rawOption := range parts[1:] {
+		option := strings.TrimSpace(rawOption)
+		if option == "" {
+			return errors.New("listen option must not be empty")
 		}
+
+		key, value, hasValue := strings.Cut(option, "=")
+		key = strings.ToLower(strings.TrimSpace(key))
+		value = strings.TrimSpace(value)
+		if _, exists := seenOptions[key]; exists {
+			return fmt.Errorf("listen option %q may only be specified once", key)
+		}
+		seenOptions[key] = struct{}{}
 
 		switch key {
 		case "cert":
-			cfg.Cert = value
+			if err := requireOptionValue(key, value, hasValue); err != nil {
+				return err
+			}
+			cfg.cert = value
 
 		case "key":
-			cfg.Key = value
+			if err := requireOptionValue(key, value, hasValue); err != nil {
+				return err
+			}
+			cfg.key = value
 
 		case "cafile":
-			cfg.CAFile = value
+			if err := requireOptionValue(key, value, hasValue); err != nil {
+				return err
+			}
+			cfg.caFile = value
 
 		case "commonname":
-			cfg.CommonName = value
+			if err := requireOptionValue(key, value, hasValue); err != nil {
+				return err
+			}
+			cfg.commonName = value
 
 		case "verify":
-			if value == "" {
-				cfg.VerifyPeer = true
-			} else {
-				b, err := strconv.ParseBool(value)
-				if err != nil {
-					return fmt.Errorf("invalid verify value: %q", value)
-				}
-				cfg.VerifyPeer = b
+			if !hasValue || value == "" {
+				cfg.verifyPeer = true
+				continue
 			}
+			verify, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("invalid verify value: %q: %w", value, err)
+			}
+			cfg.verifyPeer = verify
+
+		case "timeout":
+			if err := requireOptionValue(key, value, hasValue); err != nil {
+				return err
+			}
+			timeout, err := time.ParseDuration(value)
+			if err != nil || timeout < 0 {
+				return fmt.Errorf("invalid timeout value %q", value)
+			}
+			cfg.timeout = timeout
+
+		case "maxbody":
+			limit, err := parsePositiveBytesLimit(key, value, hasValue)
+			if err != nil {
+				return err
+			}
+			cfg.maxBodyBytes = limit
+
+		case "maxoutput":
+			limit, err := parsePositiveBytesLimit(key, value, hasValue)
+			if err != nil {
+				return err
+			}
+			cfg.maxOutputBytes = limit
 
 		default:
-			return fmt.Errorf("unknown listen option: %s", key)
+			return fmt.Errorf("unknown listen option: %q", key)
 		}
 	}
 
-	if (cfg.Cert != "" && cfg.Key == "") || (cfg.Cert == "" && cfg.Key != "") {
-		return fmt.Errorf("both cert and key are required for TLS")
+	if (cfg.cert == "") != (cfg.key == "") {
+		return errors.New("both cert and key are required for TLS")
 	}
-
+	if cfg.cert == "" && (cfg.verifyPeer || cfg.caFile != "" || cfg.commonName != "") {
+		return errors.New("verify, cafile, and commonname require TLS cert and key")
+	}
+	if !cfg.verifyPeer && (cfg.caFile != "" || cfg.commonName != "") {
+		return errors.New("cafile and commonname require verify")
+	}
 	return nil
 }
 
-func splitCommaOptions(s string) []string {
-	var result []string
-	var buf strings.Builder
+func requireOptionValue(key, value string, hasValue bool) error {
+	if !hasValue || value == "" {
+		return fmt.Errorf("listen option %q requires a value", key)
+	}
+	return nil
+}
 
+func parsePositiveBytesLimit(key, value string, hasValue bool) (int64, error) {
+	if err := requireOptionValue(key, value, hasValue); err != nil {
+		return 0, err
+	}
+	limit, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || limit <= 0 {
+		return 0, fmt.Errorf("listen option %q must be a positive byte count", key)
+	}
+	return limit, nil
+}
+
+func normalizeListenAddress(addr string) (string, error) {
+	if !strings.Contains(addr, ":") {
+		port, err := strconv.Atoi(addr)
+		if err != nil || port < 0 || port > 65535 {
+			return "", fmt.Errorf("invalid port: %q", addr)
+		}
+		return ":" + addr, nil
+	}
+
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil || port == "" {
+		return "", fmt.Errorf("invalid listen address %q: expected host:port", addr)
+	}
+	return addr, nil
+}
+
+func splitQuotedList(value string, sep rune) ([]string, error) {
+	var parts []string
+	var part strings.Builder
 	quoted := false
-	for _, r := range s {
-		switch r {
-		case '"':
-			quoted = !quoted
-			buf.WriteRune(r)
+	runes := []rune(value)
 
-		case ',':
-			if quoted {
-				buf.WriteRune(r)
-			} else {
-				result = append(result, buf.String())
-				buf.Reset()
+	for i := 0; i < len(runes); i++ {
+		curr := runes[i]
+		if curr == '\\' && i+1 < len(runes) {
+			next := runes[i+1]
+			if next == '"' || (!quoted && next == sep) {
+				part.WriteRune(next)
+				i++
+				continue
 			}
-
-		default:
-			buf.WriteRune(r)
 		}
-	}
-
-	if buf.Len() > 0 {
-		result = append(result, buf.String())
-	}
-
-	return result
-}
-
-func trimQuote(s string) string {
-	if len(s) >= 2 {
-		if (s[0] == '"' && s[len(s)-1] == '"') || (s[0] == '\'' && s[len(s)-1] == '\'') {
-			return s[1 : len(s)-1]
-		}
-	}
-	return s
-}
-
-func splitCommand(s string) []string {
-	var result []string
-	var buf strings.Builder
-
-	quoted := false
-	for _, r := range s {
-		switch r {
-		case '"':
+		if curr == '"' {
 			quoted = !quoted
-
-		case ' ':
-			if quoted {
-				buf.WriteRune(r)
-			} else if buf.Len() > 0 {
-				result = append(result, buf.String())
-				buf.Reset()
-			}
-
-		default:
-			buf.WriteRune(r)
+			continue
 		}
+		if curr == sep && !quoted {
+			parts = append(parts, part.String())
+			part.Reset()
+			continue
+		}
+		part.WriteRune(curr)
 	}
 
-	if buf.Len() > 0 {
-		result = append(result, buf.String())
+	if quoted {
+		return nil, errors.New("unterminated double quote")
 	}
-
-	return result
+	parts = append(parts, part.String())
+	return parts, nil
 }
 
-func buildTLSConfig(cfg *Config) (*tls.Config, error) {
-	if cfg.Cert == "" || cfg.Key == "" {
+func splitCommand(value string) ([]string, error) {
+	var parts []string
+	var part strings.Builder
+	var quote rune
+	tokenStarted := false
+	runes := []rune(value)
+
+	for i := 0; i < len(runes); i++ {
+		curr := runes[i]
+		if curr == '\\' && i+1 < len(runes) {
+			next := runes[i+1]
+			if (quote == 0 && (unicode.IsSpace(next) || next == '\'' || next == '"')) ||
+				(quote != 0 && next == quote) {
+				part.WriteRune(next)
+				tokenStarted = true
+				i++
+				continue
+			}
+		}
+
+		if curr == '\'' || curr == '"' {
+			if quote == 0 {
+				quote = curr
+				tokenStarted = true
+				continue
+			}
+			if quote == curr {
+				quote = 0
+				continue
+			}
+		}
+
+		if unicode.IsSpace(curr) && quote == 0 {
+			if tokenStarted {
+				parts = append(parts, part.String())
+				part.Reset()
+				tokenStarted = false
+			}
+			continue
+		}
+
+		part.WriteRune(curr)
+		tokenStarted = true
+	}
+
+	if quote != 0 {
+		return nil, errors.New("unterminated quote")
+	}
+	if tokenStarted {
+		parts = append(parts, part.String())
+	}
+	return parts, nil
+}
+
+func buildTLSConfig(cfg *config) (*tls.Config, error) {
+	if cfg.cert == "" {
 		return nil, nil
 	}
 
-	tlsConfig := &tls.Config{}
-	if cfg.VerifyPeer {
-		tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
-		if cfg.CAFile == "" {
-			pool, err := x509.SystemCertPool()
-			if err != nil {
-				return nil, err
-			}
-			tlsConfig.ClientCAs = pool
-		} else {
-			caPEM, err := os.ReadFile(cfg.CAFile)
-			if err != nil {
-				return nil, err
-			}
-			pool := x509.NewCertPool()
-			if ok := pool.AppendCertsFromPEM(caPEM); !ok {
-				return nil, fmt.Errorf("failed to parse CA file")
-			}
-			tlsConfig.ClientCAs = pool
-		}
-	} else {
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
+	if !cfg.verifyPeer {
 		tlsConfig.ClientAuth = tls.NoClientCert
-		if cfg.CAFile != "" {
-			log.Printf("warning: cafile ignored because verify is disabled")
-		}
-		if cfg.CommonName != "" {
-			log.Printf("warning: commonname ignored because verify is disabled")
+		return tlsConfig, nil
+	}
+
+	clientCAs, err := loadClientCAs(cfg.caFile)
+	if err != nil {
+		return nil, err
+	}
+	tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+	tlsConfig.ClientCAs = clientCAs
+
+	if cfg.commonName != "" {
+		expectedName := cfg.commonName
+		tlsConfig.VerifyConnection = func(state tls.ConnectionState) error {
+			if len(state.PeerCertificates) == 0 {
+				return errors.New("client certificate is required")
+			}
+			return verifyClientCertificateName(state.PeerCertificates[0], expectedName)
 		}
 	}
+
 	return tlsConfig, nil
+}
+
+func verifyClientCertificateName(cert *x509.Certificate, expectedName string) error {
+	altNames := make([]string, 0, len(cert.DNSNames)+len(cert.IPAddresses))
+
+	for _, dns := range cert.DNSNames {
+		altNames = append(altNames, dns)
+	}
+	for _, ip := range cert.IPAddresses {
+		altNames = append(altNames, ip.String())
+	}
+	hasSAN := len(altNames) > 0
+
+	if hasSAN && cert.VerifyHostname(expectedName) == nil {
+		return nil
+	}
+
+	if !hasSAN {
+		var subjectAlternativeNameOID = asn1.ObjectIdentifier{2, 5, 29, 17}
+		for _, ext := range cert.Extensions {
+			if ext.Id.Equal(subjectAlternativeNameOID) {
+				hasSAN = true
+				break
+			}
+		}
+	}
+	if hasSAN {
+		return fmt.Errorf("client certificate subject alternative names %q do not match %q", altNames, expectedName)
+	}
+
+	if !strings.EqualFold(cert.Subject.CommonName, expectedName) {
+		return fmt.Errorf("client certificate common name %q does not match %q", cert.Subject.CommonName, expectedName)
+	}
+	return nil
+}
+
+func loadClientCAs(caFile string) (*x509.CertPool, error) {
+	if caFile == "" {
+		pool, err := x509.SystemCertPool()
+		if err != nil {
+			return nil, fmt.Errorf("load system CA pool: %w", err)
+		}
+		if pool == nil {
+			pool = x509.NewCertPool()
+		}
+		return pool, nil
+	}
+
+	caPEM, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil, fmt.Errorf("read CA file %q: %w", caFile, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("CA file %q does not contain a valid certificate", caFile)
+	}
+	return pool, nil
 }
 
 /////////////////////////////////////////////////////////////////////////////
 // handler
 //
-type CGIHandler struct {
-	Config *Config
+type cgiHandler struct {
+	config *config
 }
 
-func (h *CGIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	log.Printf("connected from %v: %v %v", r.RemoteAddr, r.Method, r.URL)
+func (h *cgiHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	log.Printf("connected from %s: %s %s", r.RemoteAddr, r.Method, r.URL.RequestURI())
 
-	if h.Config.VerifyPeer && h.Config.CommonName != "" {
-		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
-			http.Error(w, "Forbidden", http.StatusForbidden)
-			return
-		}
-		cert := r.TLS.PeerCertificates[0]
-		if !strings.EqualFold(cert.Subject.CommonName, h.Config.CommonName) {
-			http.Error(w, "Forbidden", http.StatusForbidden)
-			return
-		}
-	}
-
-	ctx := r.Context()
-	if h.Config.Timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, h.Config.Timeout)
-		defer cancel()
-	}
-
-	env := buildEnv(r)
-	resp, err := runCGI(ctx, h.Config, env, r.Body)
-	if err != nil {
-		log.Printf("exec error: %v", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	if r.ContentLength > h.config.maxBodyBytes {
+		http.Error(w, http.StatusText(http.StatusRequestEntityTooLarge), http.StatusRequestEntityTooLarge)
 		return
 	}
 
-	writeResponse(w, resp)
+	body := http.MaxBytesReader(w, r.Body, h.config.maxBodyBytes)
+	defer body.Close()
+
+	ctx := r.Context()
+	if h.config.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, h.config.timeout)
+		defer cancel()
+	}
+
+	resp, err := runCGI(ctx, h.config, buildCGIEnv(os.Environ(), r), body)
+	if err != nil {
+		log.Printf("CGI request failed: %v", err)
+		if errors.Is(err, context.Canceled) && r.Context().Err() != nil {
+			return
+		}
+		status := cgiErrorStatus(ctx, err)
+		http.Error(w, http.StatusText(status), status)
+		return
+	}
+
+	if err := writeCGIResponse(w, resp); err != nil {
+		log.Printf("write response failed: %v", err)
+	}
 }
 
-func buildEnv(r *http.Request) []string {
-	env := make([]string, 0, 32)
-	add := func(k, v string) {
-		env = append(env, k+"="+v)
+func cgiErrorStatus(ctx context.Context, err error) int {
+	// var maxBytesError *http.MaxBytesError
+	// if errors.As(err, &maxBytesError) {
+	if err.Error() == "http: request body too large" {
+		return http.StatusRequestEntityTooLarge
 	}
-
-	add("REQUEST_METHOD", r.Method)
-	add("REQUEST_URI", r.URL.RequestURI())
-	add("PATH_INFO", r.URL.Path)
-	add("QUERY_STRING", r.URL.RawQuery)
-	add("SERVER_PROTOCOL", r.Proto)
-
-	host, port, err := net.SplitHostPort(r.Host)
-	if err != nil {
-		host = r.Host
-		port = ""
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return http.StatusGatewayTimeout
 	}
-	add("SERVER_NAME", host)
-	add("SERVER_PORT", port)
+	return http.StatusBadGateway
+}
 
-	if addr, port, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		add("REMOTE_ADDR", addr)
-		add("REMOTE_PORT", port)
+func buildCGIEnv(base []string, r *http.Request) []string {
+	vars := make(map[string]string, 32)
+	vars["GATEWAY_INTERFACE"] = "CGI/1.1"
+	vars["SERVER_SOFTWARE"] = "httpcat"
+	vars["REQUEST_METHOD"] = r.Method
+	vars["REQUEST_URI"] = r.URL.RequestURI()
+	vars["PATH_INFO"] = r.URL.Path
+	vars["QUERY_STRING"] = r.URL.RawQuery
+	vars["SERVER_PROTOCOL"] = r.Proto
+	vars["SCRIPT_NAME"] = ""
+
+	serverName, serverPort := splitHostPort(r.Host)
+	if localAddr, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok {
+		localHost, localPort := splitHostPort(localAddr.String())
+		if serverName == "" {
+			serverName = localHost
+		}
+		if serverPort == "" {
+			serverPort = localPort
+		}
 	}
+	vars["SERVER_NAME"] = serverName
+	vars["SERVER_PORT"] = serverPort
+
+	remoteAddr, remotePort := splitHostPort(r.RemoteAddr)
+	vars["REMOTE_ADDR"] = remoteAddr
+	vars["REMOTE_PORT"] = remotePort
 
 	if r.ContentLength >= 0 {
-		add("CONTENT_LENGTH", strconv.FormatInt(r.ContentLength, 10))
+		vars["CONTENT_LENGTH"] = strconv.FormatInt(r.ContentLength, 10)
 	}
-
 	if ct := r.Header.Get("Content-Type"); ct != "" {
-		add("CONTENT_TYPE", ct)
+		vars["CONTENT_TYPE"] = ct
 	}
-
 	if r.TLS != nil {
-		add("HTTPS", "on")
+		vars["HTTPS"] = "on"
 	} else {
-		add("HTTPS", "off")
+		vars["HTTPS"] = "off"
 	}
 
-	for k, v := range r.Header {
-		key := "HTTP_" + strings.ToUpper(strings.ReplaceAll(k, "-", "_"))
-		// CGI では Content 系は専用変数なので除外
-		if key == "HTTP_CONTENT_TYPE" || key == "HTTP_CONTENT_LENGTH" {
+	headerNames := make([]string, 0, len(r.Header))
+	for name := range r.Header {
+		headerNames = append(headerNames, name)
+	}
+	sort.Strings(headerNames)
+	for _, name := range headerNames {
+		envName := "HTTP_" + strings.ToUpper(strings.ReplaceAll(name, "-", "_"))
+		if envName == "HTTP_CONTENT_TYPE" || envName == "HTTP_CONTENT_LENGTH" || envName == "HTTP_PROXY" {
 			continue
 		}
-
-		add(key, strings.Join(v, ","))
-	}
-
-	return env
-}
-
-type CGIResponse struct {
-	Status  int
-	Headers http.Header
-	Body    []byte
-}
-
-func runCGI(
-	ctx context.Context,
-	cfg *Config,
-	env []string,
-	body io.Reader,
-) (*CGIResponse, error) {
-
-	cmd := exec.CommandContext(ctx, cfg.Command, cfg.Args...)
-	cmd.Env = append(os.Environ(), env...)
-
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, err
-	}
-	defer stdin.Close()
-
-	out, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-
-	errOut, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, err
-	}
-
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-
-	go func() {
-		_, _ = io.Copy(os.Stderr, errOut)
-	}()
-
-	go func() {
-		_, _ = io.Copy(stdin, body)
-		_ = stdin.Close()
-	}()
-
-	data, err := io.ReadAll(out)
-	if err != nil {
-		return nil, err
-	}
-
-	err = cmd.Wait()
-	if err != nil {
-		return nil, fmt.Errorf("command failed: %w", err)
-	}
-
-	return parseCGIResponse(data)
-}
-
-func parseCGIResponse(data []byte) (*CGIResponse, error) {
-	resp := &CGIResponse{
-		Status:  200,
-		Headers: make(http.Header),
-	}
-
-	// ヘッダ終了位置検索
-	idx := bytes.Index(data, []byte("\r\n\r\n"))
-	sepLen := 4
-	if idx < 0 {
-		idx = bytes.Index(data, []byte("\n\n"))
-		sepLen = 2
-	}
-
-	if idx < 0 {
-		// ヘッダ無しの場合
-		resp.Body = data
-		return resp, nil
-	}
-
-	headerPart := data[:idx]
-	resp.Body = data[idx+sepLen:]
-	scanner := bufio.NewScanner(bytes.NewReader(headerPart))
-
-	first := true
-	for scanner.Scan() {
-		line := scanner.Text()
-		if first {
-			first = false
-
-			// CGI 形式ではない HTTP status line
-			if strings.HasPrefix(line, "HTTP/") {
-				fields := strings.Fields(line)
-				if len(fields) >= 2 {
-					code, err := strconv.Atoi(fields[1])
-					if err == nil {
-						resp.Status = code
-					}
-				}
-				continue
-			}
+		sep := ", "
+		if strings.EqualFold(name, "Cookie") {
+			sep = "; "
 		}
+		value := strings.Join(r.Header.Values(name), sep)
+		if existing, ok := vars[envName]; ok && existing != "" {
+			vars[envName] = existing + sep + value
+		} else {
+			vars[envName] = value
+		}
+	}
 
-		pos := strings.IndexByte(line, ':')
-		if pos < 0 {
+	return mergeEnv(base, vars)
+}
+
+func splitHostPort(addr string) (string, string) {
+	host, port, err := net.SplitHostPort(addr)
+	if err == nil {
+		return host, port
+	}
+	return strings.Trim(addr, "[]"), ""
+}
+
+func mergeEnv(base []string, vars map[string]string) []string {
+	result := make([]string, 0, len(base)+len(vars))
+	for _, entry := range base {
+		key, _, found := strings.Cut(entry, "=")
+		if !found || isCGIEnvKey(key) {
 			continue
 		}
-
-		key := strings.TrimSpace(line[:pos])
-		val := strings.TrimSpace(line[pos+1:])
-		if strings.EqualFold(key, "Status") {
-			fields := strings.Fields(val)
-			if len(fields) > 0 {
-				code, err := strconv.Atoi(fields[0])
-				if err == nil {
-					resp.Status = code
-				}
-			}
-			continue
-		}
-
-		resp.Headers.Add(key, val)
+		result = append(result, entry)
 	}
 
-	if err := scanner.Err(); err != nil {
+	keys := make([]string, 0, len(vars))
+	for key := range vars {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		result = append(result, key+"="+vars[key])
+	}
+	return result
+}
+
+func isCGIEnvKey(key string) bool {
+	upperKey := strings.ToUpper(key)
+	if strings.HasPrefix(upperKey, "HTTP_") {
+		return true
+	}
+	switch upperKey {
+	case "AUTH_TYPE", "CONTENT_LENGTH", "CONTENT_TYPE", "GATEWAY_INTERFACE", "HTTPS",
+		"PATH_INFO", "PATH_TRANSLATED", "QUERY_STRING", "REMOTE_ADDR", "REMOTE_HOST",
+		"REMOTE_IDENT", "REMOTE_PORT", "REMOTE_USER", "REQUEST_METHOD", "REQUEST_URI",
+		"SCRIPT_NAME", "SERVER_NAME", "SERVER_PORT", "SERVER_PROTOCOL", "SERVER_SOFTWARE":
+		return true
+	default:
+		return false
+	}
+}
+
+type errorTrackingReader struct {
+	reader  io.Reader
+	err     error
+	onError func()
+}
+
+func (r *errorTrackingReader) Read(buffer []byte) (int, error) {
+	count, err := r.reader.Read(buffer)
+	if err != nil && !errors.Is(err, io.EOF) {
+		r.err = err
+		if r.onError != nil {
+			r.onError()
+		}
+	}
+	return count, err
+}
+
+type limitedBuffer struct {
+	buffer   bytes.Buffer
+	limit    int64
+	exceeded bool
+	onLimit  func()
+}
+
+var errGGIOutputTooLarge = errors.New("CGI output exceeds configured limit")
+
+func (b *limitedBuffer) Write(data []byte) (int, error) {
+	remaining := b.limit - int64(b.buffer.Len())
+	if int64(len(data)) <= remaining {
+		return b.buffer.Write(data)
+	}
+
+	written := 0
+	if remaining > 0 {
+		written, _ = b.buffer.Write(data[:int(remaining)])
+	}
+	b.exceeded = true
+	if b.onLimit != nil {
+		b.onLimit()
+	}
+	return written, errGGIOutputTooLarge
+}
+
+func runCGI(ctx context.Context, cfg *config, env []string, body io.Reader) (*cgiResponse, error) {
+	cmdCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	reqBody := &errorTrackingReader{reader: body, onError: cancel}
+	output := &limitedBuffer{limit: cfg.maxOutputBytes, onLimit: cancel}
+	cmd := exec.CommandContext(cmdCtx, cfg.command, cfg.args...)
+	cmd.Env = env
+	cmd.Stdin = reqBody
+	cmd.Stdout = output
+	cmd.Stderr = os.Stderr
+
+	cmdErr := cmd.Run()
+	if output.exceeded {
+		return nil, errGGIOutputTooLarge
+	}
+	if reqBody.err != nil {
+		return nil, fmt.Errorf("read request body: %w", reqBody.err)
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if cmdErr != nil {
+		return nil, fmt.Errorf("command failed: %w", cmdErr)
+	}
 
+	resp, err := parseCGIResponse(output.buffer.Bytes())
+	if err != nil {
+		return nil, fmt.Errorf("parse CGI response: %w", err)
+	}
 	return resp, nil
 }
 
-func writeResponse(w http.ResponseWriter, resp *CGIResponse) {
-	for k, v := range resp.Headers {
-		for _, x := range v {
-			w.Header().Add(k, x)
-		}
+type cgiResponse struct {
+	status  int
+	headers http.Header
+	body    []byte
+}
+
+func parseCGIResponse(data []byte) (*cgiResponse, error) {
+	headerPart, body, hasHeaders := splitCGIOutput(data)
+	if !hasHeaders {
+		return &cgiResponse{status: http.StatusOK, headers: make(http.Header), body: data}, nil
 	}
 
-	if w.Header().Get("Content-Length") == "" {
-		w.Header().Set("Content-Length", strconv.Itoa(len(resp.Body)))
+	status := http.StatusOK
+	hasStatusLine := false
+	if firstLine, remainder := takeFirstLine(headerPart); strings.HasPrefix(firstLine, "HTTP/") {
+		parsedStatus, err := parseHTTPStatusLine(firstLine)
+		if err != nil {
+			return nil, err
+		}
+		status = parsedStatus
+		headerPart = remainder
+		hasStatusLine = true
 	}
-	w.WriteHeader(resp.Status)
-	_, _ = w.Write(resp.Body)
+
+	headerInput := make([]byte, 0, len(headerPart)+2)
+	headerInput = append(headerInput, headerPart...)
+	headerInput = append(headerInput, '\n', '\n')
+	mimeHeaders, err := textproto.NewReader(bufio.NewReader(bytes.NewReader(headerInput))).ReadMIMEHeader()
+	if err != nil {
+		return nil, fmt.Errorf("invalid CGI headers: %w", err)
+	}
+	headers := http.Header(mimeHeaders)
+
+	statusValues := headers.Values("Status")
+	if hasStatusLine && len(statusValues) > 0 {
+		return nil, errors.New("CGI response contains both an HTTP status line and a Status header")
+	}
+	if len(statusValues) > 1 {
+		return nil, errors.New("CGI response contains multiple Status headers")
+	}
+	if len(statusValues) == 1 {
+		status, err = parseCGIStatus(statusValues[0])
+		if err != nil {
+			return nil, err
+		}
+	}
+	headers.Del("Status")
+
+	if !hasStatusLine && len(statusValues) == 0 && headers.Get("Location") != "" {
+		status = http.StatusFound
+	}
+	if !statusAllowsBody(status) && len(body) > 0 {
+		return nil, fmt.Errorf("status %d must not include a response body", status)
+	}
+	sanitizeCGIHeaders(headers)
+
+	return &cgiResponse{status: status, headers: headers, body: body}, nil
+}
+
+func splitCGIOutput(data []byte) ([]byte, []byte, bool) {
+	sepIdx := -1
+	sepLen := 0
+	for _, sep := range [][]byte{[]byte("\r\n\r\n"), []byte("\n\n")} {
+		if i := bytes.Index(data, sep); i >= 0 && (sepIdx < 0 || i < sepIdx) {
+			sepIdx = i
+			sepLen = len(sep)
+		}
+	}
+	if sepIdx < 0 {
+		return nil, data, false
+	}
+
+	headerPart := data[:sepIdx]
+	firstLine, _ := takeFirstLine(headerPart)
+	if !strings.HasPrefix(firstLine, "HTTP/") && !strings.Contains(firstLine, ":") {
+		return nil, data, false
+	}
+	return headerPart, data[sepIdx+sepLen:], true
+}
+
+func takeFirstLine(data []byte) (string, []byte) {
+	lineEnd := bytes.IndexByte(data, '\n')
+	if lineEnd < 0 {
+		return strings.TrimSuffix(string(data), "\r"), nil
+	}
+	line := strings.TrimSuffix(string(data[:lineEnd]), "\r")
+	return line, data[lineEnd+1:]
+}
+
+func parseHTTPStatusLine(line string) (int, error) {
+	parts := strings.SplitN(line, " ", 3)
+	if len(parts) < 2 {
+		return 0, fmt.Errorf("invalid HTTP status line %q", line)
+	}
+	if _, _, ok := http.ParseHTTPVersion(parts[0]); !ok {
+		return 0, fmt.Errorf("invalid HTTP version in status line %q", line)
+	}
+	return parseStatusCode(parts[1])
+}
+
+func parseCGIStatus(value string) (int, error) {
+	fields := strings.Fields(value)
+	if len(fields) == 0 {
+		return 0, errors.New("empty CGI Status header")
+	}
+	return parseStatusCode(fields[0])
+}
+
+func parseStatusCode(value string) (int, error) {
+	if len(value) != 3 {
+		return 0, fmt.Errorf("invalid CGI status code %q", value)
+	}
+	status, err := strconv.Atoi(value)
+	if err != nil || status < 200 || status > 599 {
+		return 0, fmt.Errorf("invalid CGI status code %q", value)
+	}
+	return status, nil
+}
+
+func statusAllowsBody(status int) bool {
+	return status != http.StatusNoContent && status != http.StatusResetContent && status != http.StatusNotModified
+}
+
+func sanitizeCGIHeaders(headers http.Header) {
+	for _, vs := range headers.Values("Connection") {
+		for _, token := range strings.Split(vs, ",") {
+			if name := textproto.TrimString(token); name != "" {
+				headers.Del(name)
+			}
+		}
+	}
+	for _, name := range []string{
+		"Connection",
+		"Content-Length",
+		"Keep-Alive",
+		"Proxy-Authenticate",
+		"Proxy-Authorization",
+		"Proxy-Connection",
+		"TE",
+		"Trailer",
+		"Transfer-Encoding",
+		"Upgrade",
+	} {
+		headers.Del(name)
+	}
+}
+
+func writeCGIResponse(w http.ResponseWriter, r *cgiResponse) error {
+	for n, vs := range r.headers {
+		for _, v := range vs {
+			w.Header().Add(n, v)
+		}
+	}
+	if statusAllowsBody(r.status) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(r.body)))
+	}
+
+	w.WriteHeader(r.status)
+	if len(r.body) == 0 {
+		return nil
+	}
+	_, err := w.Write(r.body)
+	return err
+}
+
+func runServer(cfg *config) error {
+	tlsConfig, err := buildTLSConfig(cfg)
+	if err != nil {
+		return err
+	}
+
+	writeTimeout := cfg.timeout
+	if writeTimeout > 0 {
+		writeTimeout += shutdownTimeout
+	}
+	server := &http.Server{
+		Addr:              cfg.addr,
+		Handler:           &cgiHandler{config: cfg},
+		ReadTimeout:       cfg.timeout,
+		ReadHeaderTimeout: readHeaderTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       time.Minute,
+		MaxHeaderBytes:    1 << 20,
+		TLSConfig:         tlsConfig,
+	}
+
+	serveErrors := make(chan error, 1)
+	go func() {
+		if tlsConfig != nil {
+			log.Printf("listening on %s (TLS)", cfg.addr)
+			serveErrors <- server.ListenAndServeTLS(cfg.cert, cfg.key)
+			return
+		}
+		log.Printf("listening on %s", cfg.addr)
+		serveErrors <- server.ListenAndServe()
+	}()
+
+	signalContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+
+	select {
+	case serveErr := <-serveErrors:
+		if errors.Is(serveErr, http.ErrServerClosed) {
+			return nil
+		}
+		return serveErr
+
+	case <-signalContext.Done():
+		log.Print("shutting down")
+	}
+
+	shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancelShutdown()
+	if err := server.Shutdown(shutdownContext); err != nil {
+		_ = server.Close()
+		<-serveErrors
+		return fmt.Errorf("shut down HTTP server: %w", err)
+	}
+
+	serveErr := <-serveErrors
+	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+		return serveErr
+	}
+	return nil
 }
 
 func main() {
 	cfg, err := parseArgs(os.Args[1:])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	if err := runServer(cfg); err != nil {
+		log.Printf("server failed: %v", err)
 		os.Exit(1)
-	}
-
-	tlsConfig, err := buildTLSConfig(cfg)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-
-	server := &http.Server{
-		Addr:              cfg.Addr,
-		Handler:           &CGIHandler{Config: cfg},
-		ReadHeaderTimeout: 10 * time.Second,
-		TLSConfig:         tlsConfig,
-	}
-
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		<-stop
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		log.Println("shutting down")
-		server.Shutdown(ctx)
-	}()
-
-	if tlsConfig != nil {
-		log.Printf("listening on %s (w/ tls)", cfg.Addr)
-		err = server.ListenAndServeTLS(cfg.Cert, cfg.Key)
-	} else {
-		log.Printf("listening on %s", cfg.Addr)
-		err = server.ListenAndServe()
-	}
-
-	if err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatal(err)
 	}
 }
