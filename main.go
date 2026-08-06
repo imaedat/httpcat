@@ -26,7 +26,6 @@ import (
 )
 
 const (
-	defaultCommandTimeout = 30 * time.Second
 	defaultMaxBodyBytes   = int64(64 << 20)
 	defaultMaxOutputBytes = int64(64 << 20)
 	readHeaderTimeout     = 10 * time.Second
@@ -48,18 +47,20 @@ type config struct {
 	command string
 	args    []string
 
-	timeout        time.Duration
 	maxBodyBytes   int64
 	maxOutputBytes int64
+
+	readTimeout  time.Duration
+	writeTimeout time.Duration
+	// timeout time.Duration
 }
 
 func parseArgs(args []string) (*config, error) {
 	if len(args) < 2 {
-		return nil, errors.New("usage: httpcat listen:addr[,cert=file,key=file,verify[=bool],cafile=file,commonname=name,timeout=30s,maxbody=bytes,maxoutput=bytes] exec:\"command [args...]\"")
+		return nil, errors.New("usage: httpcat listen:addr[,cert=file,key=file,verify[=bool],cafile=file,commonname=name,maxbody=bytes,maxoutput=bytes] exec:\"command [args...]\"")
 	}
 
 	cfg := &config{
-		timeout:        defaultCommandTimeout,
 		maxBodyBytes:   defaultMaxBodyBytes,
 		maxOutputBytes: defaultMaxOutputBytes,
 	}
@@ -172,15 +173,25 @@ func parseListen(cfg *config, spec string) error {
 			}
 			cfg.verifyPeer = verify
 
-		case "timeout":
+		case "readtimeout":
 			if err := requireOptionValue(key, value, hasValue); err != nil {
 				return err
 			}
 			timeout, err := time.ParseDuration(value)
-			if err != nil || timeout < 0 {
+			if err != nil {
 				return fmt.Errorf("invalid timeout value %q", value)
 			}
-			cfg.timeout = timeout
+			cfg.readTimeout = timeout
+
+		case "writetimeout":
+			if err := requireOptionValue(key, value, hasValue); err != nil {
+				return err
+			}
+			timeout, err := time.ParseDuration(value)
+			if err != nil {
+				return fmt.Errorf("invalid timeout value %q", value)
+			}
+			cfg.writeTimeout = timeout
 
 		case "maxbody":
 			limit, err := parsePositiveBytesLimit(key, value, hasValue)
@@ -392,11 +403,13 @@ func verifyClientCertificateName(cert *x509.Certificate, expectedName string) er
 		}
 	}
 	if hasSAN {
-		return fmt.Errorf("client certificate subject alternative names %q do not match %q", altNames, expectedName)
+		return fmt.Errorf("client certificate subject alternative names %q do not match %q",
+			altNames, expectedName)
 	}
 
 	if !strings.EqualFold(cert.Subject.CommonName, expectedName) {
-		return fmt.Errorf("client certificate common name %q does not match %q", cert.Subject.CommonName, expectedName)
+		return fmt.Errorf("client certificate common name %q does not match %q",
+			cert.Subject.CommonName, expectedName)
 	}
 	return nil
 }
@@ -427,15 +440,16 @@ func loadClientCAs(caFile string) (*x509.CertPool, error) {
 /////////////////////////////////////////////////////////////////////////////
 // handler
 //
-type cgiHandler struct {
+type execHandler struct {
 	config *config
 }
 
-func (h *cgiHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (h *execHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("connected from %s: %s %s", r.RemoteAddr, r.Method, r.URL.RequestURI())
 
 	if r.ContentLength > h.config.maxBodyBytes {
-		http.Error(w, http.StatusText(http.StatusRequestEntityTooLarge), http.StatusRequestEntityTooLarge)
+		http.Error(w, http.StatusText(http.StatusRequestEntityTooLarge),
+			http.StatusRequestEntityTooLarge)
 		return
 	}
 
@@ -443,50 +457,45 @@ func (h *cgiHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer body.Close()
 
 	ctx := r.Context()
-	if h.config.timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, h.config.timeout)
-		defer cancel()
-	}
-
-	resp, err := runCGI(ctx, h.config, buildCGIEnv(os.Environ(), r), body)
+	resp, err := execCommand(ctx, h.config, buildCGIEnv(os.Environ(), r), body)
 	if err != nil {
-		log.Printf("CGI request failed: %v", err)
+		log.Printf("exec command failed: %v", err)
 		if errors.Is(err, context.Canceled) && r.Context().Err() != nil {
 			return
 		}
-		status := cgiErrorStatus(ctx, err)
+		status := execErrorStatus(ctx, err)
 		http.Error(w, http.StatusText(status), status)
 		return
 	}
 
-	if err := writeCGIResponse(w, resp); err != nil {
+	if err := writeResponse(w, resp); err != nil {
 		log.Printf("write response failed: %v", err)
 	}
 }
 
-func cgiErrorStatus(ctx context.Context, err error) int {
+func execErrorStatus(ctx context.Context, err error) int {
 	// var maxBytesError *http.MaxBytesError
 	// if errors.As(err, &maxBytesError) {
 	if err.Error() == "http: request body too large" {
 		return http.StatusRequestEntityTooLarge
 	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+	if errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return http.StatusGatewayTimeout
 	}
 	return http.StatusBadGateway
 }
 
 func buildCGIEnv(base []string, r *http.Request) []string {
-	vars := make(map[string]string, 32)
-	vars["GATEWAY_INTERFACE"] = "CGI/1.1"
-	vars["SERVER_SOFTWARE"] = "httpcat"
-	vars["REQUEST_METHOD"] = r.Method
-	vars["REQUEST_URI"] = r.URL.RequestURI()
-	vars["PATH_INFO"] = r.URL.Path
-	vars["QUERY_STRING"] = r.URL.RawQuery
-	vars["SERVER_PROTOCOL"] = r.Proto
-	vars["SCRIPT_NAME"] = ""
+	env := make(map[string]string, 32)
+	env["GATEWAY_INTERFACE"] = "CGI/1.1"
+	env["SERVER_SOFTWARE"] = "httpcat"
+	env["REQUEST_METHOD"] = r.Method
+	env["REQUEST_URI"] = r.URL.RequestURI()
+	env["PATH_INFO"] = r.URL.Path
+	env["QUERY_STRING"] = r.URL.RawQuery
+	env["SERVER_PROTOCOL"] = r.Proto
+	env["SCRIPT_NAME"] = ""
 
 	serverName, serverPort := splitHostPort(r.Host)
 	if localAddr, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok {
@@ -498,23 +507,23 @@ func buildCGIEnv(base []string, r *http.Request) []string {
 			serverPort = localPort
 		}
 	}
-	vars["SERVER_NAME"] = serverName
-	vars["SERVER_PORT"] = serverPort
+	env["SERVER_NAME"] = serverName
+	env["SERVER_PORT"] = serverPort
 
 	remoteAddr, remotePort := splitHostPort(r.RemoteAddr)
-	vars["REMOTE_ADDR"] = remoteAddr
-	vars["REMOTE_PORT"] = remotePort
+	env["REMOTE_ADDR"] = remoteAddr
+	env["REMOTE_PORT"] = remotePort
 
 	if r.ContentLength >= 0 {
-		vars["CONTENT_LENGTH"] = strconv.FormatInt(r.ContentLength, 10)
+		env["CONTENT_LENGTH"] = strconv.FormatInt(r.ContentLength, 10)
 	}
 	if ct := r.Header.Get("Content-Type"); ct != "" {
-		vars["CONTENT_TYPE"] = ct
+		env["CONTENT_TYPE"] = ct
 	}
 	if r.TLS != nil {
-		vars["HTTPS"] = "on"
+		env["HTTPS"] = "on"
 	} else {
-		vars["HTTPS"] = "off"
+		env["HTTPS"] = "off"
 	}
 
 	headerNames := make([]string, 0, len(r.Header))
@@ -524,7 +533,8 @@ func buildCGIEnv(base []string, r *http.Request) []string {
 	sort.Strings(headerNames)
 	for _, name := range headerNames {
 		envName := "HTTP_" + strings.ToUpper(strings.ReplaceAll(name, "-", "_"))
-		if envName == "HTTP_CONTENT_TYPE" || envName == "HTTP_CONTENT_LENGTH" || envName == "HTTP_PROXY" {
+		if envName == "HTTP_CONTENT_TYPE" || envName == "HTTP_CONTENT_LENGTH" ||
+			envName == "HTTP_PROXY" {
 			continue
 		}
 		sep := ", "
@@ -532,14 +542,14 @@ func buildCGIEnv(base []string, r *http.Request) []string {
 			sep = "; "
 		}
 		value := strings.Join(r.Header.Values(name), sep)
-		if existing, ok := vars[envName]; ok && existing != "" {
-			vars[envName] = existing + sep + value
+		if existing, ok := env[envName]; ok && existing != "" {
+			env[envName] = existing + sep + value
 		} else {
-			vars[envName] = value
+			env[envName] = value
 		}
 	}
 
-	return mergeEnv(base, vars)
+	return mergeEnv(base, env)
 }
 
 func splitHostPort(addr string) (string, string) {
@@ -550,8 +560,8 @@ func splitHostPort(addr string) (string, string) {
 	return strings.Trim(addr, "[]"), ""
 }
 
-func mergeEnv(base []string, vars map[string]string) []string {
-	result := make([]string, 0, len(base)+len(vars))
+func mergeEnv(base []string, env map[string]string) []string {
+	result := make([]string, 0, len(base)+len(env))
 	for _, entry := range base {
 		key, _, found := strings.Cut(entry, "=")
 		if !found || isCGIEnvKey(key) {
@@ -560,13 +570,13 @@ func mergeEnv(base []string, vars map[string]string) []string {
 		result = append(result, entry)
 	}
 
-	keys := make([]string, 0, len(vars))
-	for key := range vars {
+	keys := make([]string, 0, len(env))
+	for key := range env {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
-		result = append(result, key+"="+vars[key])
+		result = append(result, key+"="+env[key])
 	}
 	return result
 }
@@ -611,7 +621,7 @@ type limitedBuffer struct {
 	onLimit  func()
 }
 
-var errGGIOutputTooLarge = errors.New("CGI output exceeds configured limit")
+var errOutputTooLarge = errors.New("exec output exceeds configured limit")
 
 func (b *limitedBuffer) Write(data []byte) (int, error) {
 	remaining := b.limit - int64(b.buffer.Len())
@@ -627,24 +637,30 @@ func (b *limitedBuffer) Write(data []byte) (int, error) {
 	if b.onLimit != nil {
 		b.onLimit()
 	}
-	return written, errGGIOutputTooLarge
+	return written, errOutputTooLarge
 }
 
-func runCGI(ctx context.Context, cfg *config, env []string, body io.Reader) (*cgiResponse, error) {
+type execResponse struct {
+	status  int
+	headers http.Header
+	body    []byte
+}
+
+func execCommand(ctx context.Context, cfg *config, env []string, body io.Reader) (*execResponse, error) {
 	cmdCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	reqBody := &errorTrackingReader{reader: body, onError: cancel}
-	output := &limitedBuffer{limit: cfg.maxOutputBytes, onLimit: cancel}
+	cmdOut := &limitedBuffer{limit: cfg.maxOutputBytes, onLimit: cancel}
 	cmd := exec.CommandContext(cmdCtx, cfg.command, cfg.args...)
 	cmd.Env = env
 	cmd.Stdin = reqBody
-	cmd.Stdout = output
+	cmd.Stdout = cmdOut
 	cmd.Stderr = os.Stderr
 
 	cmdErr := cmd.Run()
-	if output.exceeded {
-		return nil, errGGIOutputTooLarge
+	if cmdOut.exceeded {
+		return nil, errOutputTooLarge
 	}
 	if reqBody.err != nil {
 		return nil, fmt.Errorf("read request body: %w", reqBody.err)
@@ -656,23 +672,17 @@ func runCGI(ctx context.Context, cfg *config, env []string, body io.Reader) (*cg
 		return nil, fmt.Errorf("command failed: %w", cmdErr)
 	}
 
-	resp, err := parseCGIResponse(output.buffer.Bytes())
+	resp, err := parseCGIResponse(cmdOut.buffer.Bytes())
 	if err != nil {
 		return nil, fmt.Errorf("parse CGI response: %w", err)
 	}
 	return resp, nil
 }
 
-type cgiResponse struct {
-	status  int
-	headers http.Header
-	body    []byte
-}
-
-func parseCGIResponse(data []byte) (*cgiResponse, error) {
-	headerPart, body, hasHeaders := splitCGIOutput(data)
+func parseCGIResponse(data []byte) (*execResponse, error) {
+	headerPart, body, hasHeaders := splitExecOutput(data)
 	if !hasHeaders {
-		return &cgiResponse{status: http.StatusOK, headers: make(http.Header), body: data}, nil
+		return &execResponse{status: http.StatusOK, headers: make(http.Header), body: data}, nil
 	}
 
 	status := http.StatusOK
@@ -690,18 +700,19 @@ func parseCGIResponse(data []byte) (*cgiResponse, error) {
 	headerInput := make([]byte, 0, len(headerPart)+2)
 	headerInput = append(headerInput, headerPart...)
 	headerInput = append(headerInput, '\n', '\n')
-	mimeHeaders, err := textproto.NewReader(bufio.NewReader(bytes.NewReader(headerInput))).ReadMIMEHeader()
+	mimeHeaders, err :=
+		textproto.NewReader(bufio.NewReader(bytes.NewReader(headerInput))).ReadMIMEHeader()
 	if err != nil {
-		return nil, fmt.Errorf("invalid CGI headers: %w", err)
+		return nil, fmt.Errorf("invalid HTTP headers: %w", err)
 	}
 	headers := http.Header(mimeHeaders)
 
 	statusValues := headers.Values("Status")
 	if hasStatusLine && len(statusValues) > 0 {
-		return nil, errors.New("CGI response contains both an HTTP status line and a Status header")
+		return nil, errors.New("response contains both an HTTP status line and a Status header")
 	}
 	if len(statusValues) > 1 {
-		return nil, errors.New("CGI response contains multiple Status headers")
+		return nil, errors.New("response contains multiple Status headers")
 	}
 	if len(statusValues) == 1 {
 		status, err = parseCGIStatus(statusValues[0])
@@ -719,10 +730,10 @@ func parseCGIResponse(data []byte) (*cgiResponse, error) {
 	}
 	sanitizeCGIHeaders(headers)
 
-	return &cgiResponse{status: status, headers: headers, body: body}, nil
+	return &execResponse{status: status, headers: headers, body: body}, nil
 }
 
-func splitCGIOutput(data []byte) ([]byte, []byte, bool) {
+func splitExecOutput(data []byte) ([]byte, []byte, bool) {
 	sepIdx := -1
 	sepLen := 0
 	for _, sep := range [][]byte{[]byte("\r\n\r\n"), []byte("\n\n")} {
@@ -773,17 +784,18 @@ func parseCGIStatus(value string) (int, error) {
 
 func parseStatusCode(value string) (int, error) {
 	if len(value) != 3 {
-		return 0, fmt.Errorf("invalid CGI status code %q", value)
+		return 0, fmt.Errorf("invalid HTTP status code %q", value)
 	}
 	status, err := strconv.Atoi(value)
 	if err != nil || status < 200 || status > 599 {
-		return 0, fmt.Errorf("invalid CGI status code %q", value)
+		return 0, fmt.Errorf("invalid HTTP status code %q", value)
 	}
 	return status, nil
 }
 
 func statusAllowsBody(status int) bool {
-	return status != http.StatusNoContent && status != http.StatusResetContent && status != http.StatusNotModified
+	return status != http.StatusNoContent && status != http.StatusResetContent &&
+		status != http.StatusNotModified
 }
 
 func sanitizeCGIHeaders(headers http.Header) {
@@ -810,7 +822,7 @@ func sanitizeCGIHeaders(headers http.Header) {
 	}
 }
 
-func writeCGIResponse(w http.ResponseWriter, r *cgiResponse) error {
+func writeResponse(w http.ResponseWriter, r *execResponse) error {
 	for n, vs := range r.headers {
 		for _, v := range vs {
 			w.Header().Add(n, v)
@@ -834,16 +846,12 @@ func runServer(cfg *config) error {
 		return err
 	}
 
-	writeTimeout := cfg.timeout
-	if writeTimeout > 0 {
-		writeTimeout += shutdownTimeout
-	}
 	server := &http.Server{
 		Addr:              cfg.addr,
-		Handler:           &cgiHandler{config: cfg},
-		ReadTimeout:       cfg.timeout,
+		Handler:           &execHandler{config: cfg},
 		ReadHeaderTimeout: readHeaderTimeout,
-		WriteTimeout:      writeTimeout,
+		ReadTimeout:       cfg.readTimeout,
+		WriteTimeout:      cfg.writeTimeout,
 		IdleTimeout:       time.Minute,
 		MaxHeaderBytes:    1 << 20,
 		TLSConfig:         tlsConfig,
@@ -860,8 +868,8 @@ func runServer(cfg *config) error {
 		serveErrors <- server.ListenAndServe()
 	}()
 
-	signalContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stopSignals()
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	select {
 	case serveErr := <-serveErrors:
@@ -870,13 +878,13 @@ func runServer(cfg *config) error {
 		}
 		return serveErr
 
-	case <-signalContext.Done():
+	case <-sigCtx.Done():
 		log.Print("shutting down")
 	}
 
-	shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
-	defer cancelShutdown()
-	if err := server.Shutdown(shutdownContext); err != nil {
+	srvCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := server.Shutdown(srvCtx); err != nil {
 		_ = server.Close()
 		<-serveErrors
 		return fmt.Errorf("shut down HTTP server: %w", err)
