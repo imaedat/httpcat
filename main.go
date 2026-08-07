@@ -26,7 +26,6 @@ import (
 )
 
 const (
-	defaultMaxBodyBytes   = int64(64 << 20)
 	defaultMaxOutputBytes = int64(64 << 20)
 	readHeaderTimeout     = 10 * time.Second
 	shutdownTimeout       = 5 * time.Second
@@ -61,7 +60,6 @@ func parseArgs(args []string) (*config, error) {
 	}
 
 	cfg := &config{
-		maxBodyBytes:   defaultMaxBodyBytes,
 		maxOutputBytes: defaultMaxOutputBytes,
 	}
 	seenListen := false
@@ -179,7 +177,7 @@ func parseListen(cfg *config, spec string) error {
 			}
 			timeout, err := time.ParseDuration(value)
 			if err != nil {
-				return fmt.Errorf("invalid timeout value %q", value)
+				return fmt.Errorf("invalid readtimeout value %q", value)
 			}
 			cfg.readTimeout = timeout
 
@@ -189,7 +187,7 @@ func parseListen(cfg *config, spec string) error {
 			}
 			timeout, err := time.ParseDuration(value)
 			if err != nil {
-				return fmt.Errorf("invalid timeout value %q", value)
+				return fmt.Errorf("invalid writetimeout value %q", value)
 			}
 			cfg.writeTimeout = timeout
 
@@ -447,13 +445,17 @@ type execHandler struct {
 func (h *execHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("connected from %s: %s %s", r.RemoteAddr, r.Method, r.URL.RequestURI())
 
-	if r.ContentLength > h.config.maxBodyBytes {
-		http.Error(w, http.StatusText(http.StatusRequestEntityTooLarge),
-			http.StatusRequestEntityTooLarge)
-		return
+	var body io.ReadCloser
+	if h.config.maxBodyBytes == 0 {
+		body = r.Body
+	} else {
+		if r.ContentLength > h.config.maxBodyBytes {
+			http.Error(w, http.StatusText(http.StatusRequestEntityTooLarge),
+				http.StatusRequestEntityTooLarge)
+			return
+		}
+		body = http.MaxBytesReader(w, r.Body, h.config.maxBodyBytes)
 	}
-
-	body := http.MaxBytesReader(w, r.Body, h.config.maxBodyBytes)
 	defer body.Close()
 
 	ctx := r.Context()
