@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/asn1"
 	"errors"
 	"fmt"
 	"io"
@@ -56,7 +55,7 @@ type config struct {
 
 func parseArgs(args []string) (*config, error) {
 	if len(args) < 2 {
-		return nil, errors.New("usage: httpcat listen:addr[,cert=file,key=file,verify[=bool],cafile=file,commonname=name,maxbody=bytes,maxoutput=bytes] exec:\"command [args...]\"")
+		return nil, errors.New("usage: httpcat listen:addr[,cert=file,key=file,verify[=bool],cafile=file] exec:\"command [args...]\"")
 	}
 
 	cfg := &config{
@@ -364,52 +363,23 @@ func buildTLSConfig(cfg *config) (*tls.Config, error) {
 	tlsConfig.ClientCAs = clientCAs
 
 	if cfg.commonName != "" {
-		expectedName := cfg.commonName
 		tlsConfig.VerifyConnection = func(state tls.ConnectionState) error {
 			if len(state.PeerCertificates) == 0 {
 				return errors.New("client certificate is required")
 			}
-			return verifyClientCertificateName(state.PeerCertificates[0], expectedName)
+			cert := state.PeerCertificates[0]
+			err := cert.VerifyHostname(cfg.commonName)
+			if err == nil {
+				return nil
+			}
+			if strings.EqualFold(cert.Subject.CommonName, cfg.commonName) {
+				return nil
+			}
+			return err
 		}
 	}
 
 	return tlsConfig, nil
-}
-
-func verifyClientCertificateName(cert *x509.Certificate, expectedName string) error {
-	altNames := make([]string, 0, len(cert.DNSNames)+len(cert.IPAddresses))
-
-	for _, dns := range cert.DNSNames {
-		altNames = append(altNames, dns)
-	}
-	for _, ip := range cert.IPAddresses {
-		altNames = append(altNames, ip.String())
-	}
-	hasSAN := len(altNames) > 0
-
-	if hasSAN && cert.VerifyHostname(expectedName) == nil {
-		return nil
-	}
-
-	if !hasSAN {
-		var subjectAlternativeNameOID = asn1.ObjectIdentifier{2, 5, 29, 17}
-		for _, ext := range cert.Extensions {
-			if ext.Id.Equal(subjectAlternativeNameOID) {
-				hasSAN = true
-				break
-			}
-		}
-	}
-	if hasSAN {
-		return fmt.Errorf("client certificate subject alternative names %q do not match %q",
-			altNames, expectedName)
-	}
-
-	if !strings.EqualFold(cert.Subject.CommonName, expectedName) {
-		return fmt.Errorf("client certificate common name %q does not match %q",
-			cert.Subject.CommonName, expectedName)
-	}
-	return nil
 }
 
 func loadClientCAs(caFile string) (*x509.CertPool, error) {
