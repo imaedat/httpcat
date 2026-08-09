@@ -40,7 +40,9 @@ echo_request_env()
   "SERVER_PORT": '$SERVER_PORT',
   "REMOTE_ADDR": "'$REMOTE_ADDR'",
   "REMOTE_PORT": '$REMOTE_PORT',
-  "HTTPS": "'$HTTPS'"
+  "HTTPS": "'$HTTPS'",
+  "HTTPS_X509_COMMONNAME": "'$HTTPS_X509_COMMONNAME'",
+  "HTTPS_X509_SAN_DNS": "'$HTTPS_X509_SAN_DNS'"
 }'
 
   send_response 200 "$json" "application/json"

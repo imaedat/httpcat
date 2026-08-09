@@ -494,6 +494,10 @@ func buildCGIEnv(base []string, r *http.Request) []string {
 	}
 	if r.TLS != nil {
 		env["HTTPS"] = "on"
+		if len(r.TLS.PeerCertificates) > 0 {
+			env["HTTPS_X509_COMMONNAME"] = r.TLS.PeerCertificates[0].Subject.CommonName
+			env["HTTPS_X509_SAN_DNS"] = strings.Join(r.TLS.PeerCertificates[0].DNSNames, ",")
+		}
 	} else {
 		env["HTTPS"] = "off"
 	}
