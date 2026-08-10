@@ -214,12 +214,6 @@ func parseListen(cfg *config, spec string) error {
 	if (cfg.cert == "") != (cfg.key == "") {
 		return errors.New("both cert and key are required for TLS")
 	}
-	if cfg.cert == "" && (cfg.verifyPeer || cfg.caFile != "" || cfg.commonName != "") {
-		return errors.New("verify, cafile, and commonname require TLS cert and key")
-	}
-	if !cfg.verifyPeer && (cfg.caFile != "" || cfg.commonName != "") {
-		return errors.New("cafile and commonname require verify")
-	}
 	return nil
 }
 
