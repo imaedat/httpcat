@@ -622,6 +622,7 @@ func isCGIEnvKey(key string) bool {
 	}
 }
 
+// Request Reader
 type errorTrackingReader struct {
 	reader  io.Reader
 	err     error
@@ -639,14 +640,19 @@ func (r *errorTrackingReader) Read(buffer []byte) (int, error) {
 	return count, err
 }
 
-type limitedBuffer struct {
-	buffer   bytes.Buffer
-	limit    int64
-	exceeded bool
-	onLimit  func()
+// Command Output Writer
+type outputWriter interface {
+	io.Writer
+	Err() error
 }
 
-var errOutputTooLarge = errors.New("exec output exceeds configured limit")
+// for normal output
+type limitedBuffer struct {
+	buffer  bytes.Buffer
+	limit   int64
+	err     error
+	onLimit func()
+}
 
 func (b *limitedBuffer) Write(data []byte) (int, error) {
 	remaining := b.limit - int64(b.buffer.Len())
@@ -658,11 +664,35 @@ func (b *limitedBuffer) Write(data []byte) (int, error) {
 	if remaining > 0 {
 		written, _ = b.buffer.Write(data[:int(remaining)])
 	}
-	b.exceeded = true
+	b.err = errors.New("exec output exceeds configured limit")
 	if b.onLimit != nil {
 		b.onLimit()
 	}
-	return written, errOutputTooLarge
+	return written, b.err
+}
+
+func (b *limitedBuffer) Err() error {
+	return b.err
+}
+
+// for stream output
+type flushWriter struct {
+	writer http.ResponseWriter
+}
+
+func (w *flushWriter) Write(data []byte) (int, error) {
+	n, err := w.writer.Write(data)
+	if err != nil {
+		return n, err
+	}
+	if f, ok := w.writer.(http.Flusher); ok {
+		f.Flush()
+	}
+	return n, nil
+}
+
+func (w *flushWriter) Err() error {
+	return nil
 }
 
 type execResponse struct {
@@ -683,23 +713,25 @@ func execCommand(
 	defer cancel()
 
 	errReader := &errorTrackingReader{reader: body, onError: cancel}
-	limBuffer := &limitedBuffer{limit: cfg.maxOutputBytes, onLimit: cancel}
+	var outWriter outputWriter
 
 	cmd := exec.CommandContext(cmdCtx, cfg.command, cfg.args...)
 	cmd.Env = env
 	cmd.Stdin = errReader
 	if cfg.stream {
-		cmd.Stdout = w
+		outWriter = &flushWriter{writer: w}
+		cmd.Stdout = outWriter
 		w.Header().Set("Content-Type", "application/octet-stream")
 	} else {
-		cmd.Stdout = limBuffer
+		outWriter = &limitedBuffer{limit: cfg.maxOutputBytes, onLimit: cancel}
+		cmd.Stdout = outWriter
 	}
 	cmd.Stderr = os.Stderr
 
 	cmdErr := cmd.Run()
 
-	if limBuffer.exceeded {
-		return nil, errOutputTooLarge
+	if err := outWriter.Err(); err != nil {
+		return nil, err
 	}
 	if errReader.err != nil {
 		return nil, fmt.Errorf("read request body: %w", errReader.err)
@@ -713,13 +745,14 @@ func execCommand(
 
 	if cfg.stream {
 		return nil, nil
-	}
 
-	resp, err := parseCGIResponse(limBuffer.buffer.Bytes())
-	if err != nil {
-		return nil, fmt.Errorf("parse CGI response: %w", err)
+	} else {
+		resp, err := parseCGIResponse(outWriter.(*limitedBuffer).buffer.Bytes())
+		if err != nil {
+			return nil, fmt.Errorf("parse CGI response: %w", err)
+		}
+		return resp, nil
 	}
-	return resp, nil
 }
 
 func parseCGIResponse(data []byte) (*execResponse, error) {
