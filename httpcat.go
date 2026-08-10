@@ -24,6 +24,8 @@ import (
 	"unicode"
 )
 
+var version = "0.0.1"
+
 const (
 	defaultMaxOutputBytes = int64(64 << 20)
 	readHeaderTimeout     = 10 * time.Second
