@@ -46,6 +46,7 @@ type config struct {
 
 	command string
 	args    []string
+	stream  bool
 
 	maxBodyBytes   int64
 	maxOutputBytes int64
@@ -82,15 +83,9 @@ func parseArgs(args []string) (*config, error) {
 				return nil, errors.New("exec may only be specified once")
 			}
 			seenExec = true
-			parts, err := splitCommand(strings.TrimSpace(strings.TrimPrefix(arg, "exec:")))
-			if err != nil {
+			if err := parseExec(cfg, strings.TrimPrefix(arg, "exec:")); err != nil {
 				return nil, fmt.Errorf("invalid exec specification: %w", err)
 			}
-			if len(parts) == 0 || parts[0] == "" {
-				return nil, errors.New("exec command must not be empty")
-			}
-			cfg.command = parts[0]
-			cfg.args = parts[1:]
 
 		default:
 			return nil, fmt.Errorf("unknown argument: %q", arg)
@@ -286,6 +281,60 @@ func splitQuotedList(value string, sep rune) ([]string, error) {
 	return parts, nil
 }
 
+func parseExec(cfg *config, spec string) error {
+	parts, err := splitQuotedList(spec, ',')
+	if err != nil {
+		return err
+	}
+	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
+		return errors.New("exec command must not be empty")
+	}
+
+	cmd, err := splitCommand(strings.TrimSpace(parts[0]))
+	if err != nil {
+		return fmt.Errorf("invalid exec specification: %w", err)
+	}
+	if len(cmd) == 0 || cmd[0] == "" {
+		return errors.New("exec command must not be empty")
+	}
+	cfg.command = cmd[0]
+	cfg.args = cmd[1:]
+
+	seenOptions := make(map[string]struct{}, len(parts)-1)
+	for _, rawOption := range parts[1:] {
+		option := strings.TrimSpace(rawOption)
+		if option == "" {
+			return errors.New("exec option must not be empty")
+		}
+
+		key, value, hasValue := strings.Cut(option, "=")
+		key = strings.ToLower(strings.TrimSpace(key))
+		value = strings.TrimSpace(value)
+		if _, exists := seenOptions[key]; exists {
+			return fmt.Errorf("exec option %q may only be specified once", key)
+		}
+		seenOptions[key] = struct{}{}
+
+		switch key {
+		case "stream":
+			if !hasValue || value == "" {
+				cfg.stream = true
+				continue
+			}
+			stream, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("invalid stream value: %q: %w", value, err)
+			}
+			cfg.stream = stream
+
+		default:
+			return fmt.Errorf("unknown exec option: %q", key)
+		}
+	}
+
+	return nil
+}
+
 func splitCommand(value string) ([]string, error) {
 	var parts []string
 	var part strings.Builder
@@ -425,7 +474,7 @@ func (h *execHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer body.Close()
 
 	ctx := r.Context()
-	resp, err := execCommand(ctx, h.config, buildCGIEnv(os.Environ(), r), body)
+	resp, err := execCommand(ctx, h.config, buildCGIEnv(os.Environ(), r), body, w)
 	if err != nil {
 		log.Printf("exec command failed: %v", err)
 		if errors.Is(err, context.Canceled) && r.Context().Err() != nil {
@@ -433,6 +482,10 @@ func (h *execHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		status := execErrorStatus(ctx, err)
 		http.Error(w, http.StatusText(status), status)
+		return
+	}
+
+	if h.config.stream {
 		return
 	}
 
@@ -618,24 +671,38 @@ type execResponse struct {
 	body    []byte
 }
 
-func execCommand(ctx context.Context, cfg *config, env []string, body io.Reader) (*execResponse, error) {
+func execCommand(
+	ctx context.Context,
+	cfg *config,
+	env []string,
+	body io.Reader,
+	w http.ResponseWriter,
+) (*execResponse, error) {
+
 	cmdCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	reqBody := &errorTrackingReader{reader: body, onError: cancel}
-	cmdOut := &limitedBuffer{limit: cfg.maxOutputBytes, onLimit: cancel}
+	errReader := &errorTrackingReader{reader: body, onError: cancel}
+	limBuffer := &limitedBuffer{limit: cfg.maxOutputBytes, onLimit: cancel}
+
 	cmd := exec.CommandContext(cmdCtx, cfg.command, cfg.args...)
 	cmd.Env = env
-	cmd.Stdin = reqBody
-	cmd.Stdout = cmdOut
+	cmd.Stdin = errReader
+	if cfg.stream {
+		cmd.Stdout = w
+		w.Header().Set("Content-Type", "application/octet-stream")
+	} else {
+		cmd.Stdout = limBuffer
+	}
 	cmd.Stderr = os.Stderr
 
 	cmdErr := cmd.Run()
-	if cmdOut.exceeded {
+
+	if limBuffer.exceeded {
 		return nil, errOutputTooLarge
 	}
-	if reqBody.err != nil {
-		return nil, fmt.Errorf("read request body: %w", reqBody.err)
+	if errReader.err != nil {
+		return nil, fmt.Errorf("read request body: %w", errReader.err)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -644,7 +711,11 @@ func execCommand(ctx context.Context, cfg *config, env []string, body io.Reader)
 		return nil, fmt.Errorf("command failed: %w", cmdErr)
 	}
 
-	resp, err := parseCGIResponse(cmdOut.buffer.Bytes())
+	if cfg.stream {
+		return nil, nil
+	}
+
+	resp, err := parseCGIResponse(limBuffer.buffer.Bytes())
 	if err != nil {
 		return nil, fmt.Errorf("parse CGI response: %w", err)
 	}
