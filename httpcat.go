@@ -27,9 +27,8 @@ import (
 var version = "0.0.1"
 
 const (
-	defaultMaxOutputBytes = int64(64 << 20)
-	readHeaderTimeout     = 10 * time.Second
-	shutdownTimeout       = 5 * time.Second
+	readHeaderTimeout = 10 * time.Second
+	shutdownTimeout   = 5 * time.Second
 )
 
 /////////////////////////////////////////////////////////////////////////////
@@ -61,9 +60,7 @@ func parseArgs(args []string) (*config, error) {
 		return nil, errors.New("usage: httpcat listen:addr[,cert=file,key=file,verify[=bool],cafile=file] exec:\"command [args...]\"")
 	}
 
-	cfg := &config{
-		maxOutputBytes: defaultMaxOutputBytes,
-	}
+	cfg := &config{}
 	seenListen := false
 	seenExec := false
 
@@ -655,6 +652,10 @@ type limitedBuffer struct {
 }
 
 func (b *limitedBuffer) Write(data []byte) (int, error) {
+	if b.limit == 0 {
+		return b.buffer.Write(data)
+	}
+
 	remaining := b.limit - int64(b.buffer.Len())
 	if int64(len(data)) <= remaining {
 		return b.buffer.Write(data)
