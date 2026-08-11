@@ -470,38 +470,7 @@ func (h *execHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer body.Close()
 
-	ctx := r.Context()
-	resp, err := execCommand(ctx, h.config, buildCGIEnv(os.Environ(), r), body, w)
-	if err != nil {
-		log.Printf("exec command failed: %v", err)
-		if errors.Is(err, context.Canceled) && r.Context().Err() != nil {
-			return
-		}
-		status := execErrorStatus(ctx, err)
-		http.Error(w, http.StatusText(status), status)
-		return
-	}
-
-	if h.config.stream {
-		return
-	}
-
-	if err := writeResponse(w, resp); err != nil {
-		log.Printf("write response failed: %v", err)
-	}
-}
-
-func execErrorStatus(ctx context.Context, err error) int {
-	// var maxBytesError *http.MaxBytesError
-	// if errors.As(err, &maxBytesError) {
-	if err.Error() == "http: request body too large" {
-		return http.StatusRequestEntityTooLarge
-	}
-	if errors.Is(err, context.DeadlineExceeded) ||
-		errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return http.StatusGatewayTimeout
-	}
-	return http.StatusBadGateway
+	execCommand(r.Context(), h.config, buildCGIEnv(os.Environ(), r), body, w)
 }
 
 func buildCGIEnv(base []string, r *http.Request) []string {
@@ -586,10 +555,9 @@ func mergeEnv(base []string, env map[string]string) []string {
 	result := make([]string, 0, len(base)+len(env))
 	for _, entry := range base {
 		key, _, found := strings.Cut(entry, "=")
-		if !found || isCGIEnvKey(key) {
-			continue
+		if found && !isCGIEnvKey(key) {
+			result = append(result, entry)
 		}
-		result = append(result, entry)
 	}
 
 	keys := make([]string, 0, len(env))
@@ -696,20 +664,13 @@ func (w *flushWriter) Err() error {
 	return nil
 }
 
-type execResponse struct {
-	status  int
-	headers http.Header
-	body    []byte
-}
-
 func execCommand(
 	ctx context.Context,
 	cfg *config,
 	env []string,
 	body io.Reader,
 	w http.ResponseWriter,
-) (*execResponse, error) {
-
+) {
 	cmdCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -731,29 +692,68 @@ func execCommand(
 
 	cmdErr := cmd.Run()
 
-	if err := outWriter.Err(); err != nil {
-		return nil, err
-	}
-	if errReader.err != nil {
-		return nil, fmt.Errorf("read request body: %w", errReader.err)
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if cmdErr != nil {
-		return nil, fmt.Errorf("command failed: %w", cmdErr)
-	}
+	if outWriter.Err() != nil {
+		handleExecError(ctx, w, outWriter.Err())
 
-	if cfg.stream {
-		return nil, nil
+	} else if errReader.err != nil {
+		handleExecError(ctx, w, fmt.Errorf("read request body: %w", errReader.err))
 
-	} else {
-		resp, err := parseCGIResponse(outWriter.(*limitedBuffer).buffer.Bytes())
-		if err != nil {
-			return nil, fmt.Errorf("parse CGI response: %w", err)
+	} else if ctx.Err() != nil {
+		handleExecError(ctx, w, ctx.Err())
+
+	} else if cmdErr != nil {
+		handleExecError(ctx, w, fmt.Errorf("command failed: %w", cmdErr))
+
+	} else if !cfg.stream {
+		writeResponse(ctx, w, outWriter.(*limitedBuffer))
+	}
+}
+
+func handleExecError(ctx context.Context, w http.ResponseWriter, err error) {
+	log.Printf("exec failed: %v", err)
+	if !errors.Is(err, context.Canceled) || ctx.Err() == nil {
+		status := http.StatusBadGateway
+		// var maxBytesError *http.MaxBytesError
+		// if errors.As(err, &maxBytesError) {
+		if err.Error() == "http: request body too large" {
+			status = http.StatusRequestEntityTooLarge
+		} else if errors.Is(err, context.DeadlineExceeded) ||
+			errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			status = http.StatusGatewayTimeout
 		}
-		return resp, nil
+		http.Error(w, http.StatusText(status), status)
 	}
+}
+
+func writeResponse(ctx context.Context, w http.ResponseWriter, b *limitedBuffer) {
+	resp, err := parseCGIResponse(b.buffer.Bytes())
+	if err != nil {
+		handleExecError(ctx, w, fmt.Errorf("parse CGI response: %w", err))
+		return
+	}
+
+	for n, vs := range resp.headers {
+		for _, v := range vs {
+			w.Header().Add(n, v)
+		}
+	}
+	if statusAllowsBody(resp.status) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(resp.body)))
+	}
+
+	w.WriteHeader(resp.status)
+	if len(resp.body) > 0 {
+		_, err := w.Write(resp.body)
+		if err != nil {
+			log.Printf("write response failed: %v", err)
+		}
+	}
+}
+
+type execResponse struct {
+	status  int
+	headers http.Header
+	body    []byte
 }
 
 func parseCGIResponse(data []byte) (*execResponse, error) {
@@ -897,24 +897,6 @@ func sanitizeCGIHeaders(headers http.Header) {
 	} {
 		headers.Del(name)
 	}
-}
-
-func writeResponse(w http.ResponseWriter, r *execResponse) error {
-	for n, vs := range r.headers {
-		for _, v := range vs {
-			w.Header().Add(n, v)
-		}
-	}
-	if statusAllowsBody(r.status) {
-		w.Header().Set("Content-Length", strconv.Itoa(len(r.body)))
-	}
-
-	w.WriteHeader(r.status)
-	if len(r.body) == 0 {
-		return nil
-	}
-	_, err := w.Write(r.body)
-	return err
 }
 
 func runServer(cfg *config) error {
