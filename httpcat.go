@@ -50,9 +50,9 @@ type config struct {
 	maxBodyBytes   int64
 	maxOutputBytes int64
 
-	readTimeout  time.Duration
-	writeTimeout time.Duration
-	// timeout time.Duration
+	readTimeout    time.Duration
+	writeTimeout   time.Duration
+	commandTimeout time.Duration
 }
 
 func parseArgs(args []string) (*config, error) {
@@ -323,6 +323,16 @@ func parseExec(cfg *config, spec string) error {
 				return fmt.Errorf("invalid stream value: %q: %w", value, err)
 			}
 			cfg.stream = stream
+
+		case "timeout":
+			if err := requireOptionValue(key, value, hasValue); err != nil {
+				return err
+			}
+			timeout, err := time.ParseDuration(value)
+			if err != nil {
+				return fmt.Errorf("invalid timeout value %q", value)
+			}
+			cfg.commandTimeout = timeout
 
 		default:
 			return fmt.Errorf("unknown exec option: %q", key)
@@ -689,23 +699,44 @@ func execCommand(
 		cmd.Stdout = outWriter
 	}
 	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	cmdErr := cmd.Run()
+	if err := cmd.Start(); err != nil {
+		handleExecError(cmdCtx, w, err)
+		return
+	}
+
+	cmdCh := make(chan error)
+	go func() { cmdCh <- cmd.Wait() }()
+	var cmdErr error
+	if cfg.commandTimeout > 0 {
+		timer := time.NewTimer(cfg.commandTimeout)
+		defer timer.Stop()
+		select {
+		case cmdErr = <-cmdCh:
+
+		case <-timer.C:
+			syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			cmdErr = <-cmdCh
+		}
+	} else {
+		cmdErr = <-cmdCh
+	}
 
 	if outWriter.Err() != nil {
-		handleExecError(ctx, w, outWriter.Err())
+		handleExecError(cmdCtx, w, outWriter.Err())
 
 	} else if errReader.err != nil {
-		handleExecError(ctx, w, fmt.Errorf("read request body: %w", errReader.err))
+		handleExecError(cmdCtx, w, fmt.Errorf("read request body: %w", errReader.err))
 
-	} else if ctx.Err() != nil {
-		handleExecError(ctx, w, ctx.Err())
+	} else if cmdCtx.Err() != nil {
+		handleExecError(cmdCtx, w, cmdCtx.Err())
 
 	} else if cmdErr != nil {
-		handleExecError(ctx, w, fmt.Errorf("command failed: %w", cmdErr))
+		handleExecError(cmdCtx, w, fmt.Errorf("command failed: %w", cmdErr))
 
 	} else if !cfg.stream {
-		writeResponse(ctx, w, outWriter.(*limitedBuffer))
+		writeResponse(cmdCtx, w, outWriter.(*limitedBuffer))
 	}
 }
 
