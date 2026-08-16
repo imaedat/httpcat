@@ -56,8 +56,6 @@ type config struct {
 	readTimeout    time.Duration
 	writeTimeout   time.Duration
 	commandTimeout time.Duration
-
-	env []string
 }
 
 func parseArgs(args []string) (*config, error) {
@@ -490,12 +488,12 @@ func (h *execHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	h.config.env = buildCGIEnv(os.Environ(), r)
+	ctx := context.WithValue(r.Context(), "Environ", buildCGIEnv(os.Environ(), r))
 
 	upgrade, status, key := isWebSocketRequest(r, w)
 	if upgrade {
 		if status == http.StatusOK {
-			serveWebSocket(r.Context(), h.config, key, w)
+			serveWebSocket(ctx, h.config, key, w)
 		} else {
 			http.Error(w, http.StatusText(status), status)
 		}
@@ -515,7 +513,7 @@ func (h *execHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer body.Close()
 
-	execCommand(r.Context(), h.config, body, w)
+	execCommand(ctx, h.config, body, w)
 }
 
 func buildCGIEnv(base []string, r *http.Request) []string {
@@ -717,7 +715,7 @@ func execCommand(ctx context.Context, cfg *config, body io.Reader, w http.Respon
 	var outWriter outputWriter
 
 	cmd := exec.CommandContext(cmdCtx, cfg.command, cfg.args...)
-	cmd.Env = cfg.env
+	cmd.Env = ctx.Value("Environ").([]string)
 	cmd.Stdin = errReader
 	if cfg.stream {
 		outWriter = &flushWriter{writer: w}
@@ -963,7 +961,7 @@ func sanitizeCGIHeaders(headers http.Header) {
 // WebSocket
 //
 func isWebSocketRequest(r *http.Request, w http.ResponseWriter) (bool, int, string) {
-	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+	if !headerContainsToken(r.Header.Values("Upgrade"), "websocket") {
 		return false, 0, ""
 	}
 
@@ -971,33 +969,40 @@ func isWebSocketRequest(r *http.Request, w http.ResponseWriter) (bool, int, stri
 		return true, http.StatusMethodNotAllowed, ""
 	}
 
-	upgrade := false
-	for _, value := range r.Header.Values("Connection") {
-		for _, token := range strings.Split(value, ",") {
-			if strings.EqualFold(strings.TrimSpace(token), "Upgrade") {
-				upgrade = true
-				break
-			}
-		}
-		if upgrade {
-			break
-		}
-	}
-	if !upgrade {
+	if !headerContainsToken(r.Header.Values("Connection"), "Upgrade") {
 		return true, http.StatusBadRequest, ""
 	}
 
 	if r.Header.Get("Sec-WebSocket-Version") != "13" {
 		w.Header().Set("Sec-WebSocket-Version", "13")
-		return true, http.StatusBadRequest, ""
+		return true, http.StatusUpgradeRequired, ""
 	}
 
-	key := strings.TrimSpace(r.Header.Get("Sec-WebSocket-Key"))
+	keys := r.Header.Values("Sec-WebSocket-Key")
+	if len(keys) != 1 {
+		return true, http.StatusBadRequest, ""
+	}
+	key := strings.TrimSpace(keys[0])
 	if key == "" {
+		return true, http.StatusBadRequest, ""
+	}
+	decoded, err := base64.StdEncoding.DecodeString(key)
+	if err != nil || len(decoded) != 16 {
 		return true, http.StatusBadRequest, ""
 	}
 
 	return true, http.StatusOK, key
+}
+
+func headerContainsToken(values []string, wanted string) bool {
+	for _, value := range values {
+		for _, token := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), wanted) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func serveWebSocket(ctx context.Context, cfg *config, key string, w http.ResponseWriter) {
@@ -1012,6 +1017,7 @@ func serveWebSocket(ctx context.Context, cfg *config, key string, w http.Respons
 		return
 	}
 	defer conn.Close()
+	conn.SetDeadline(time.Time{})
 
 	h := sha1.New()
 	h.Write([]byte(key))
@@ -1028,15 +1034,15 @@ func serveWebSocket(ctx context.Context, cfg *config, key string, w http.Respons
 		return
 	}
 
-	pipeCommand(ctx, cfg, conn)
+	pipeCommand(ctx, cfg, rw.Reader, conn)
 }
 
-func pipeCommand(ctx context.Context, cfg *config, conn net.Conn) {
+func pipeCommand(ctx context.Context, cfg *config, input io.Reader, conn net.Conn) {
 	cmdCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	cmd := exec.CommandContext(cmdCtx, cfg.command, cfg.args...)
-	cmd.Env = cfg.env
+	cmd.Env = ctx.Value("Environ").([]string)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Stderr = os.Stderr
 
@@ -1065,7 +1071,7 @@ func pipeCommand(ctx context.Context, cfg *config, conn net.Conn) {
 
 	copyCh := make(chan error, 2)
 	go func() {
-		_, err := io.Copy(cmdIn, conn)
+		_, err := io.Copy(cmdIn, input)
 		copyCh <- err
 	}()
 	go func() {
