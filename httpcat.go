@@ -45,8 +45,6 @@ type config struct {
 	caFile     string
 	commonName string
 
-	webSocket bool
-
 	command string
 	args    []string
 	stream  bool
@@ -58,6 +56,8 @@ type config struct {
 	readTimeout    time.Duration
 	writeTimeout   time.Duration
 	commandTimeout time.Duration
+
+	env []string
 }
 
 func parseArgs(args []string) (*config, error) {
@@ -209,17 +209,6 @@ func parseListen(cfg *config, spec string) error {
 				return err
 			}
 			cfg.maxConnection = int(maxconn)
-
-		case "websocket":
-			if !hasValue || value == "" {
-				cfg.webSocket = true
-				continue
-			}
-			websocket, err := strconv.ParseBool(value)
-			if err != nil {
-				return fmt.Errorf("invalid websocket value: %q: %w", value, err)
-			}
-			cfg.webSocket = websocket
 
 		default:
 			return fmt.Errorf("unknown listen option: %q", key)
@@ -501,8 +490,15 @@ func (h *execHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if h.config.webSocket {
-		serveWebSocket(h.config, r, w)
+	h.config.env = buildCGIEnv(os.Environ(), r)
+
+	upgrade, status, key := isWebSocketRequest(r, w)
+	if upgrade {
+		if status == http.StatusOK {
+			serveWebSocket(r.Context(), h.config, key, w)
+		} else {
+			http.Error(w, http.StatusText(status), status)
+		}
 		return
 	}
 
@@ -519,7 +515,7 @@ func (h *execHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer body.Close()
 
-	execCommand(r.Context(), h.config, buildCGIEnv(os.Environ(), r), body, w)
+	execCommand(r.Context(), h.config, body, w)
 }
 
 func buildCGIEnv(base []string, r *http.Request) []string {
@@ -713,13 +709,7 @@ func (w *flushWriter) Err() error {
 	return nil
 }
 
-func execCommand(
-	ctx context.Context,
-	cfg *config,
-	env []string,
-	body io.Reader,
-	w http.ResponseWriter,
-) {
+func execCommand(ctx context.Context, cfg *config, body io.Reader, w http.ResponseWriter) {
 	cmdCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -727,7 +717,7 @@ func execCommand(
 	var outWriter outputWriter
 
 	cmd := exec.CommandContext(cmdCtx, cfg.command, cfg.args...)
-	cmd.Env = env
+	cmd.Env = cfg.env
 	cmd.Stdin = errReader
 	if cfg.stream {
 		outWriter = &flushWriter{writer: w}
@@ -972,13 +962,45 @@ func sanitizeCGIHeaders(headers http.Header) {
 /////////////////////////////////////////////////////////////////////////////
 // WebSocket
 //
-func serveWebSocket(cfg *config, r *http.Request, w http.ResponseWriter) {
-	key, status := validateWebSocketRequest(r, w)
-	if status != http.StatusOK {
-		http.Error(w, http.StatusText(status), status)
-		return
+func isWebSocketRequest(r *http.Request, w http.ResponseWriter) (bool, int, string) {
+	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		return false, 0, ""
 	}
 
+	if r.Method != http.MethodGet {
+		return true, http.StatusMethodNotAllowed, ""
+	}
+
+	upgrade := false
+	for _, value := range r.Header.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), "Upgrade") {
+				upgrade = true
+				break
+			}
+		}
+		if upgrade {
+			break
+		}
+	}
+	if !upgrade {
+		return true, http.StatusBadRequest, ""
+	}
+
+	if r.Header.Get("Sec-WebSocket-Version") != "13" {
+		w.Header().Set("Sec-WebSocket-Version", "13")
+		return true, http.StatusBadRequest, ""
+	}
+
+	key := strings.TrimSpace(r.Header.Get("Sec-WebSocket-Key"))
+	if key == "" {
+		return true, http.StatusBadRequest, ""
+	}
+
+	return true, http.StatusOK, key
+}
+
+func serveWebSocket(ctx context.Context, cfg *config, key string, w http.ResponseWriter) {
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "WebSocket is not supported", http.StatusInternalServerError)
@@ -1006,53 +1028,15 @@ func serveWebSocket(cfg *config, r *http.Request, w http.ResponseWriter) {
 		return
 	}
 
-	pipeCommand(cfg, r, conn)
+	pipeCommand(ctx, cfg, conn)
 }
 
-func validateWebSocketRequest(r *http.Request, w http.ResponseWriter) (string, int) {
-	if r.Method != http.MethodGet {
-		return "", http.StatusMethodNotAllowed
-	}
-
-	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
-		return "", http.StatusBadRequest
-	}
-
-	upgrade := false
-	for _, value := range r.Header.Values("Connection") {
-		for _, token := range strings.Split(value, ",") {
-			if strings.EqualFold(strings.TrimSpace(token), "Upgrade") {
-				upgrade = true
-				break
-			}
-		}
-		if upgrade {
-			break
-		}
-	}
-	if !upgrade {
-		return "", http.StatusBadRequest
-	}
-
-	if r.Header.Get("Sec-WebSocket-Version") != "13" {
-		w.Header().Set("Sec-WebSocket-Version", "13")
-		return "", http.StatusBadRequest
-	}
-
-	key := strings.TrimSpace(r.Header.Get("Sec-WebSocket-Key"))
-	if key == "" {
-		return "", http.StatusBadRequest
-	}
-
-	return key, http.StatusOK
-}
-
-func pipeCommand(cfg *config, r *http.Request, conn net.Conn) {
-	ctx, cancel := context.WithCancel(r.Context())
+func pipeCommand(ctx context.Context, cfg *config, conn net.Conn) {
+	cmdCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, cfg.command, cfg.args...)
-	cmd.Env = buildCGIEnv(os.Environ(), r)
+	cmd := exec.CommandContext(cmdCtx, cfg.command, cfg.args...)
+	cmd.Env = cfg.env
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Stderr = os.Stderr
 
@@ -1102,7 +1086,7 @@ func pipeCommand(cfg *config, r *http.Request, conn net.Conn) {
 	<-copyCh
 	waitErr := <-waitCh
 
-	if copyErr != nil && !errors.Is(copyErr, io.EOF) {
+	if copyErr != nil && !errors.Is(copyErr, io.EOF) && !errors.Is(copyErr, os.ErrClosed) {
 		log.Printf("copy failed: %v", copyErr)
 	}
 	if waitErr != nil {
