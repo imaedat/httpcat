@@ -87,6 +87,15 @@ Tools like `nc` and `socat` are useful for working with raw TCP connections, but
 `httpcat` is a small tool for exactly that use case, without requiring the command itself to implement an HTTP server.
 
 
+## Design Principles
+
+httpcat is intentionally kept small and self-contained.
+
+* **Standard library only** -- No third-party or external dependencies. It is designed to build with the Go compiler and standard library alone.
+* **No routing** -- httpcat does not provide a routing mechanism. Routing can be handled by the command itself.
+* **No configuration files** -- httpcat will not introduce configuration files. It should remain quick and easy to run.
+
+
 ## License
 
 0BSD
