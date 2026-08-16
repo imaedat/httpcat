@@ -49,6 +49,7 @@ type config struct {
 
 	maxBodyBytes   int64
 	maxOutputBytes int64
+	maxConnection  int
 
 	readTimeout    time.Duration
 	writeTimeout   time.Duration
@@ -197,6 +198,13 @@ func parseListen(cfg *config, spec string) error {
 				return err
 			}
 			cfg.maxOutputBytes = limit
+
+		case "maxconnection":
+			maxconn, err := parsePositiveBytesLimit(key, value, hasValue)
+			if err != nil {
+				return err
+			}
+			cfg.maxConnection = int(maxconn)
 
 		default:
 			return fmt.Errorf("unknown listen option: %q", key)
@@ -462,10 +470,21 @@ func loadClientCAs(caFile string) (*x509.CertPool, error) {
 //
 type execHandler struct {
 	config *config
+	sem    chan struct{}
 }
 
 func (h *execHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("connected from %s: %s %s", r.RemoteAddr, r.Method, r.URL.RequestURI())
+
+	if h.sem != nil {
+		select {
+		case h.sem <- struct{}{}:
+			defer func() { <-h.sem }()
+		default:
+			http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
+			return
+		}
+	}
 
 	var body io.ReadCloser
 	if h.config.maxBodyBytes == 0 {
@@ -936,9 +955,14 @@ func runServer(cfg *config) error {
 		return err
 	}
 
+	handler := &execHandler{config: cfg}
+	if cfg.maxConnection > 0 {
+		handler.sem = make(chan struct{}, cfg.maxConnection)
+	}
+
 	server := &http.Server{
 		Addr:              cfg.addr,
-		Handler:           &execHandler{config: cfg},
+		Handler:           handler,
 		ReadHeaderTimeout: readHeaderTimeout,
 		ReadTimeout:       cfg.readTimeout,
 		WriteTimeout:      cfg.writeTimeout,
