@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -42,6 +44,8 @@ type config struct {
 	verifyPeer bool
 	caFile     string
 	commonName string
+
+	webSocket bool
 
 	command string
 	args    []string
@@ -205,6 +209,17 @@ func parseListen(cfg *config, spec string) error {
 				return err
 			}
 			cfg.maxConnection = int(maxconn)
+
+		case "websocket":
+			if !hasValue || value == "" {
+				cfg.webSocket = true
+				continue
+			}
+			websocket, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("invalid websocket value: %q: %w", value, err)
+			}
+			cfg.webSocket = websocket
 
 		default:
 			return fmt.Errorf("unknown listen option: %q", key)
@@ -484,6 +499,11 @@ func (h *execHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
 			return
 		}
+	}
+
+	if h.config.webSocket {
+		serveWebSocket(h.config, r, w)
+		return
 	}
 
 	var body io.ReadCloser
@@ -949,6 +969,150 @@ func sanitizeCGIHeaders(headers http.Header) {
 	}
 }
 
+/////////////////////////////////////////////////////////////////////////////
+// WebSocket
+//
+func serveWebSocket(cfg *config, r *http.Request, w http.ResponseWriter) {
+	key, status := validateWebSocketRequest(r, w)
+	if status != http.StatusOK {
+		http.Error(w, http.StatusText(status), status)
+		return
+	}
+
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "WebSocket is not supported", http.StatusInternalServerError)
+		return
+	}
+
+	conn, rw, err := hijacker.Hijack()
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	h := sha1.New()
+	h.Write([]byte(key))
+	h.Write([]byte("258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+	accept := base64.StdEncoding.EncodeToString(h.Sum(nil))
+
+	if _, err = fmt.Fprintf(rw, "HTTP/1.1 101 Switching Protocols\r\n"+
+		"Upgrade: websocket\r\nConnection: Upgrade\r\n"+
+		"Sec-WebSocket-Accept: %s\r\n\r\n", accept); err == nil {
+		err = rw.Flush()
+	}
+	if err != nil {
+		log.Printf("Upgrade output failed: %v", err)
+		return
+	}
+
+	pipeCommand(cfg, r, conn)
+}
+
+func validateWebSocketRequest(r *http.Request, w http.ResponseWriter) (string, int) {
+	if r.Method != http.MethodGet {
+		return "", http.StatusMethodNotAllowed
+	}
+
+	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		return "", http.StatusBadRequest
+	}
+
+	upgrade := false
+	for _, value := range r.Header.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), "Upgrade") {
+				upgrade = true
+				break
+			}
+		}
+		if upgrade {
+			break
+		}
+	}
+	if !upgrade {
+		return "", http.StatusBadRequest
+	}
+
+	if r.Header.Get("Sec-WebSocket-Version") != "13" {
+		w.Header().Set("Sec-WebSocket-Version", "13")
+		return "", http.StatusBadRequest
+	}
+
+	key := strings.TrimSpace(r.Header.Get("Sec-WebSocket-Key"))
+	if key == "" {
+		return "", http.StatusBadRequest
+	}
+
+	return key, http.StatusOK
+}
+
+func pipeCommand(cfg *config, r *http.Request, conn net.Conn) {
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, cfg.command, cfg.args...)
+	cmd.Env = buildCGIEnv(os.Environ(), r)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Stderr = os.Stderr
+
+	cmdIn, err := cmd.StdinPipe()
+	if err != nil {
+		log.Printf("command stdin pipe failed: %v", err)
+		return
+	}
+
+	cmdOut, err := cmd.StdoutPipe()
+	if err != nil {
+		log.Printf("command stdout pipe failed: %v", err)
+		cmdIn.Close()
+		return
+	}
+
+	if err := cmd.Start(); err != nil {
+		log.Printf("exec failed: %v", err)
+		cmdIn.Close()
+		cmdOut.Close()
+		return
+	}
+
+	waitCh := make(chan error, 1)
+	go func() { waitCh <- cmd.Wait() }()
+
+	copyCh := make(chan error, 2)
+	go func() {
+		_, err := io.Copy(cmdIn, conn)
+		copyCh <- err
+	}()
+	go func() {
+		_, err := io.Copy(conn, cmdOut)
+		copyCh <- err
+	}()
+
+	copyErr := <-copyCh
+
+	conn.Close()
+	cmdIn.Close()
+	cmdOut.Close()
+
+	if cmd.Process != nil {
+		syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+
+	<-copyCh
+	waitErr := <-waitCh
+
+	if copyErr != nil && !errors.Is(copyErr, io.EOF) {
+		log.Printf("copy failed: %v", copyErr)
+	}
+	if waitErr != nil {
+		log.Printf("command failed: %v", waitErr)
+	}
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// main & server
+//
 func runServer(cfg *config) error {
 	tlsConfig, err := buildTLSConfig(cfg)
 	if err != nil {
