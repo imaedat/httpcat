@@ -45,8 +45,7 @@ type config struct {
 	caFile     string
 	commonName string
 
-	command string
-	args    []string
+	cmdline []string
 	stream  bool
 
 	maxBodyBytes   int64
@@ -304,8 +303,7 @@ func parseExec(cfg *config, spec string) error {
 	if len(cmd) == 0 || cmd[0] == "" {
 		return errors.New("exec command must not be empty")
 	}
-	cfg.command = cmd[0]
-	cfg.args = cmd[1:]
+	cfg.cmdline = cmd
 
 	seenOptions := make(map[string]struct{}, len(parts)-1)
 	for _, rawOption := range parts[1:] {
@@ -714,7 +712,7 @@ func execCommand(ctx context.Context, cfg *config, body io.Reader, w http.Respon
 	errReader := &errorTrackingReader{reader: body, onError: cancel}
 	var outWriter outputWriter
 
-	cmd := exec.CommandContext(cmdCtx, cfg.command, cfg.args...)
+	cmd := exec.CommandContext(cmdCtx, cfg.cmdline[0], cfg.cmdline[1:]...)
 	cmd.Env = ctx.Value("Environ").([]string)
 	cmd.Stdin = errReader
 	if cfg.stream {
@@ -1034,35 +1032,35 @@ func serveWebSocket(ctx context.Context, cfg *config, key string, w http.Respons
 		return
 	}
 
-	pipeCommand(ctx, cfg, rw.Reader, conn)
+	pipeCommand(ctx, cfg.cmdline, rw.Reader, conn)
 }
 
-func pipeCommand(ctx context.Context, cfg *config, input io.Reader, conn net.Conn) {
+func pipeCommand(ctx context.Context, cmdline []string, fromPeer io.Reader, toPeer io.Writer) {
 	cmdCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	cmd := exec.CommandContext(cmdCtx, cfg.command, cfg.args...)
+	cmd := exec.CommandContext(cmdCtx, cmdline[0], cmdline[1:]...)
 	cmd.Env = ctx.Value("Environ").([]string)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Stderr = os.Stderr
 
-	cmdIn, err := cmd.StdinPipe()
+	toCmd, err := cmd.StdinPipe()
 	if err != nil {
 		log.Printf("command stdin pipe failed: %v", err)
 		return
 	}
 
-	cmdOut, err := cmd.StdoutPipe()
+	fromCmd, err := cmd.StdoutPipe()
 	if err != nil {
 		log.Printf("command stdout pipe failed: %v", err)
-		cmdIn.Close()
+		toCmd.Close()
 		return
 	}
 
 	if err := cmd.Start(); err != nil {
 		log.Printf("exec failed: %v", err)
-		cmdIn.Close()
-		cmdOut.Close()
+		toCmd.Close()
+		fromCmd.Close()
 		return
 	}
 
@@ -1071,19 +1069,19 @@ func pipeCommand(ctx context.Context, cfg *config, input io.Reader, conn net.Con
 
 	copyCh := make(chan error, 2)
 	go func() {
-		_, err := io.Copy(cmdIn, input)
+		_, err := io.Copy(toCmd, fromPeer)
 		copyCh <- err
 	}()
 	go func() {
-		_, err := io.Copy(conn, cmdOut)
+		_, err := io.Copy(toPeer, fromCmd)
 		copyCh <- err
 	}()
 
 	copyErr := <-copyCh
 
-	conn.Close()
-	cmdIn.Close()
-	cmdOut.Close()
+	_ = toPeer.(net.Conn).Close()
+	_ = toCmd.Close()
+	_ = fromCmd.Close()
 
 	if cmd.Process != nil {
 		syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
