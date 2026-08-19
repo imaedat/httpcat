@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"net/textproto"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -583,8 +584,7 @@ func buildCGIEnv(base []string, r *http.Request) []string {
 	sort.Strings(headerNames)
 	for _, name := range headerNames {
 		envName := "HTTP_" + strings.ToUpper(strings.ReplaceAll(name, "-", "_"))
-		if envName == "HTTP_CONTENT_TYPE" || envName == "HTTP_CONTENT_LENGTH" ||
-			envName == "HTTP_PROXY" {
+		if envName == "HTTP_CONTENT_TYPE" || envName == "HTTP_CONTENT_LENGTH" || envName == "HTTP_PROXY" {
 			continue
 		}
 		sep := ", "
@@ -760,11 +760,7 @@ func newCommandProcess(ctx context.Context, cfg *config) *commandProcess {
 	cmd.Env = ctx.Value("Environ").([]string)
 	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	return &commandProcess{
-		ctx:    cmdCtx,
-		cancel: cancel,
-		cmd:    cmd,
-	}
+	return &commandProcess{ctx: cmdCtx, cancel: cancel, cmd: cmd}
 }
 
 func (p *commandProcess) start() error {
@@ -914,16 +910,14 @@ func parseCGIResponse(data []byte) (*execResponse, error) {
 		return &execResponse{status: http.StatusOK, headers: make(http.Header), body: data}, nil
 	}
 
-	status := http.StatusOK
-	hasStatusLine := false
+	hasStatusLine, status := false, http.StatusOK
 	if firstLine, remainder := takeFirstLine(headerPart); strings.HasPrefix(firstLine, "HTTP/") {
 		parsedStatus, err := parseHTTPStatusLine(firstLine)
 		if err != nil {
 			return nil, err
 		}
-		status = parsedStatus
 		headerPart = remainder
-		hasStatusLine = true
+		hasStatusLine, status = true, parsedStatus
 	}
 
 	headerInput := make([]byte, 0, len(headerPart)+2)
@@ -963,12 +957,10 @@ func parseCGIResponse(data []byte) (*execResponse, error) {
 }
 
 func splitExecOutput(data []byte) ([]byte, []byte, bool) {
-	sepIdx := -1
-	sepLen := 0
+	sepIdx, sepLen := -1, 0
 	for _, sep := range [][]byte{[]byte("\r\n\r\n"), []byte("\n\n")} {
 		if i := bytes.Index(data, sep); i >= 0 && (sepIdx < 0 || i < sepIdx) {
-			sepIdx = i
-			sepLen = len(sep)
+			sepIdx, sepLen = i, len(sep)
 		}
 	}
 	if sepIdx < 0 {
@@ -1058,6 +1050,10 @@ func isWebSocketRequest(r *http.Request, w http.ResponseWriter) (bool, int, stri
 		return true, http.StatusBadRequest, ""
 	}
 
+	if !webSocketOriginAllowed(r) {
+		return true, http.StatusForbidden, ""
+	}
+
 	if r.Header.Get("Sec-WebSocket-Version") != "13" {
 		w.Header().Set("Sec-WebSocket-Version", "13")
 		return true, http.StatusUpgradeRequired, ""
@@ -1088,6 +1084,34 @@ func headerContainsToken(values []string, wanted string) bool {
 		}
 	}
 	return false
+}
+
+func webSocketOriginAllowed(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	scheme, defaultPort := "http", "80"
+	if r.TLS != nil {
+		scheme, defaultPort = "https", "443"
+	}
+	if !strings.EqualFold(u.Scheme, scheme) {
+		return false
+	}
+	host, port, err := net.SplitHostPort(r.Host)
+	if err != nil {
+		host, port = r.Host, defaultPort
+	}
+	originPort := u.Port()
+	if originPort == "" {
+		originPort = defaultPort
+	}
+	return strings.EqualFold(u.Hostname(), host) && originPort == port
 }
 
 // writer for websocket
@@ -1279,7 +1303,6 @@ func (r *wsReader) handleCtrlFrame(hdr []byte, opcode byte, payloadLen uint64) e
 		if err := r.to.WriteFrame(0xa, p); err != nil {
 			return err
 		}
-	case 0xa:
 	}
 	return nil
 }
@@ -1322,11 +1345,9 @@ func serveWebSocket(ctx context.Context, cfg *config, key string, w http.Respons
 	var fromPeer io.Reader
 	var toPeer io.WriteCloser
 	if cfg.websocketMode >= 2 {
-		toPeer = &wsWriter{to: conn}
-		fromPeer = &wsReader{from: rw.Reader, to: toPeer.(*wsWriter)}
+		toPeer, fromPeer = &wsWriter{to: conn}, &wsReader{from: rw.Reader, to: toPeer.(*wsWriter)}
 	} else {
-		fromPeer = rw.Reader
-		toPeer = conn
+		toPeer, fromPeer = conn, rw.Reader
 	}
 
 	pipeCommand(ctx, cfg, fromPeer, toPeer)
@@ -1363,13 +1384,15 @@ func pipeCommand(ctx context.Context, cfg *config, fromPeer io.Reader, toPeer io
 	}()
 	go func() {
 		_, err := io.Copy(toPeer, fromCmd)
+		if err == nil && cfg.websocketMode >= 2 {
+			toPeer.(*wsWriter).WriteFrame(0x8, []byte{0x03, 0xe8})
+		}
 		copyCh <- err
 	}()
 
 	copyErr := <-copyCh
 	proc.stop()
 
-	//_ = toPeer.(io.Closer).Close()
 	_ = toPeer.Close()
 	_ = toCmd.Close()
 	_ = fromCmd.Close()
@@ -1383,7 +1406,6 @@ func pipeCommand(ctx context.Context, cfg *config, fromPeer io.Reader, toPeer io
 	if waitErr != nil && !errors.Is(proc.ctx.Err(), context.Canceled) {
 		log.Printf("command failed: %v", waitErr)
 	}
-
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -1413,13 +1435,13 @@ func runServer(cfg *config) error {
 
 	srvCh := make(chan error, 1)
 	go func() {
-		if tlsConfig != nil {
+		if tlsConfig == nil {
+			log.Printf("listening on %s", cfg.addr)
+			srvCh <- server.ListenAndServe()
+		} else {
 			log.Printf("listening on %s (TLS)", cfg.addr)
 			srvCh <- server.ListenAndServeTLS(cfg.cert, cfg.key)
-			return
 		}
-		log.Printf("listening on %s", cfg.addr)
-		srvCh <- server.ListenAndServe()
 	}()
 
 	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -1431,7 +1453,6 @@ func runServer(cfg *config) error {
 			return nil
 		}
 		return srvErr
-
 	case <-sigCtx.Done():
 		log.Print("shutting down")
 	}
