@@ -36,6 +36,14 @@ const (
 	shutdownTimeout   = 5 * time.Second
 )
 
+type contextKey int
+
+const (
+	ctxSignalContext contextKey = iota
+	ctxEnviron
+	ctxApplyTimeout
+)
+
 /////////////////////////////////////////////////////////////////////////////
 // options
 //
@@ -486,8 +494,9 @@ func loadClientCAs(caFile string) (*x509.CertPool, error) {
 // handler
 //
 type execHandler struct {
-	config *config
-	sem    chan struct{}
+	config  *config
+	rootCtx context.Context
+	sem     chan struct{}
 }
 
 func (h *execHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -503,7 +512,8 @@ func (h *execHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	ctx := context.WithValue(r.Context(), "Environ", buildCGIEnv(os.Environ(), r))
+	ctx := context.WithValue(r.Context(), ctxSignalContext, h.rootCtx)
+	ctx = context.WithValue(ctx, ctxEnviron, buildCGIEnv(os.Environ(), r))
 
 	if h.config.websocketMode >= 1 {
 		upgrade, status, key := isWebSocketRequest(r, w)
@@ -530,7 +540,7 @@ func (h *execHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer body.Close()
 
-	execCommand(context.WithValue(ctx, "ApplyTimeout", struct{}{}), h.config, body, w)
+	execCommand(context.WithValue(ctx, ctxApplyTimeout, struct{}{}), h.config, body, w)
 }
 
 func buildCGIEnv(base []string, r *http.Request) []string {
@@ -741,6 +751,7 @@ func (w *streamWriter) Started() bool {
 
 // Command Process
 type commandProcess struct {
+	sigCtx  context.Context
 	ctx     context.Context
 	cancel  context.CancelFunc
 	cmd     *exec.Cmd
@@ -751,16 +762,21 @@ type commandProcess struct {
 func newCommandProcess(ctx context.Context, cfg *config) *commandProcess {
 	var cmdCtx context.Context
 	var cancel context.CancelFunc
-	if ctx.Value("ApplyTimeout") != nil && cfg.commandTimeout > 0 {
+	if ctx.Value(ctxApplyTimeout) != nil && cfg.commandTimeout > 0 {
 		cmdCtx, cancel = context.WithTimeout(ctx, cfg.commandTimeout)
 	} else {
 		cmdCtx, cancel = context.WithCancel(ctx)
 	}
 	cmd := exec.CommandContext(cmdCtx, cfg.cmdline[0], cfg.cmdline[1:]...)
-	cmd.Env = ctx.Value("Environ").([]string)
+	cmd.Env = ctx.Value(ctxEnviron).([]string)
 	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	return &commandProcess{ctx: cmdCtx, cancel: cancel, cmd: cmd}
+	return &commandProcess{
+		sigCtx: ctx.Value(ctxSignalContext).(context.Context),
+		ctx:    cmdCtx,
+		cancel: cancel,
+		cmd:    cmd,
+	}
 }
 
 func (p *commandProcess) start() error {
@@ -775,6 +791,8 @@ func (p *commandProcess) start() error {
 		defer close(watchDone)
 		var err error
 		select {
+		case <-p.sigCtx.Done():
+			err = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
 		case <-p.ctx.Done():
 			err = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
 		case <-processDone:
@@ -1415,7 +1433,10 @@ func runServer(cfg *config) error {
 		return err
 	}
 
-	handler := &execHandler{config: cfg}
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	handler := &execHandler{config: cfg, rootCtx: sigCtx}
 	if cfg.maxConnection > 0 {
 		handler.sem = make(chan struct{}, cfg.maxConnection)
 	}
@@ -1441,9 +1462,6 @@ func runServer(cfg *config) error {
 			srvCh <- server.ListenAndServeTLS(cfg.cert, cfg.key)
 		}
 	}()
-
-	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	select {
 	case srvErr := <-srvCh:
