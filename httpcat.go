@@ -1227,6 +1227,7 @@ func (r *wsReader) readHeader() (bool, error) {
 		return false, errors.New("websocket: client frame not masked")
 	}
 
+	fin := hdr[0]&0x80 != 0
 	opcode := hdr[0] & 0x0f
 	length := uint64(hdr[1] & 0x7f)
 
@@ -1259,33 +1260,28 @@ func (r *wsReader) readHeader() (bool, error) {
 	}
 	r.maskIdx = 0
 
-	if opcode < 0x8 {
-		switch opcode {
-		case 0x0:
-			if !r.fragmented {
-				return false, errors.New("websocket: unexpected continuation frame")
-			}
-		case 0x1, 0x2:
-			if r.fragmented {
-				return false, errors.New("websocket: new data frame during fragmented message")
-			}
-		default:
-			return false, errors.New("websocket: unsupported opcode")
+	switch opcode {
+	case 0x0:
+		if !r.fragmented {
+			return false, errors.New("websocket: unexpected continuation frame")
 		}
-
-		r.fragmented = hdr[0]&0x80 == 0
-		r.remaining = int64(length)
-		return true, nil
+	case 0x1, 0x2:
+		if r.fragmented {
+			return false, errors.New("websocket: new data frame during fragmented message")
+		}
+	case 0x8, 0x9, 0xa:
+		return false, r.handleCtrlFrame(fin, opcode, length)
+	default:
+		return false, errors.New("websocket: unsupported opcode")
 	}
 
-	if err := r.handleCtrlFrame(hdr[:], opcode, length); err != nil {
-		return false, err
-	}
-	return false, nil
+	r.fragmented = !fin
+	r.remaining = int64(length)
+	return true, nil
 }
 
-func (r *wsReader) handleCtrlFrame(hdr []byte, opcode byte, payloadLen uint64) error {
-	if hdr[0]&0x80 == 0 || opcode > 0xa || payloadLen == 1 || payloadLen > 125 {
+func (r *wsReader) handleCtrlFrame(fin bool, opcode byte, payloadLen uint64) error {
+	if !fin || payloadLen == 1 || payloadLen > 125 {
 		return errors.New("websocket: invalid control frame")
 	}
 
@@ -1342,12 +1338,14 @@ func serveWebSocket(ctx context.Context, cfg *config, key string, w http.Respons
 		return
 	}
 
-	var fromPeer io.Reader
 	var toPeer io.WriteCloser
+	var fromPeer io.Reader
 	if cfg.websocketMode >= 2 {
-		toPeer, fromPeer = &wsWriter{to: conn}, &wsReader{from: rw.Reader, to: toPeer.(*wsWriter)}
+		toPeer = &wsWriter{to: conn}
+		fromPeer = &wsReader{from: rw.Reader, to: toPeer.(*wsWriter)}
 	} else {
-		toPeer, fromPeer = conn, rw.Reader
+		toPeer = conn
+		fromPeer = rw.Reader
 	}
 
 	pipeCommand(ctx, cfg, fromPeer, toPeer)
