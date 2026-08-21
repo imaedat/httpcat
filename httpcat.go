@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha1"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -39,9 +41,10 @@ const (
 type contextKey int
 
 const (
-	ctxSignalContext contextKey = iota
-	ctxEnviron
-	ctxApplyTimeout
+	_ contextKey = iota
+	ctxKeyID
+	ctxKeySignalCtx
+	ctxKeyEnviron
 )
 
 /////////////////////////////////////////////////////////////////////////////
@@ -243,6 +246,69 @@ func parseListen(cfg *config, spec string) error {
 	return nil
 }
 
+func parseExec(cfg *config, spec string) error {
+	parts, err := splitQuotedList(spec, ',')
+	if err != nil {
+		return err
+	}
+	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
+		return errors.New("exec command must not be empty")
+	}
+
+	cmd, err := splitCommand(strings.TrimSpace(parts[0]))
+	if err != nil {
+		return fmt.Errorf("invalid exec specification: %w", err)
+	}
+	if len(cmd) == 0 || cmd[0] == "" {
+		return errors.New("exec command must not be empty")
+	}
+	cfg.cmdline = cmd
+
+	seenOptions := make(map[string]struct{}, len(parts)-1)
+	for _, rawOption := range parts[1:] {
+		option := strings.TrimSpace(rawOption)
+		if option == "" {
+			return errors.New("exec option must not be empty")
+		}
+
+		key, value, hasValue := strings.Cut(option, "=")
+		key = strings.ToLower(strings.TrimSpace(key))
+		value = strings.TrimSpace(value)
+		if _, exists := seenOptions[key]; exists {
+			return fmt.Errorf("exec option %q may only be specified once", key)
+		}
+		seenOptions[key] = struct{}{}
+
+		switch key {
+		case "stream":
+			if !hasValue || value == "" {
+				cfg.stream = true
+				continue
+			}
+			stream, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("invalid stream value: %q: %w", value, err)
+			}
+			cfg.stream = stream
+
+		case "timeout":
+			if err := requireOptionValue(key, value, hasValue); err != nil {
+				return err
+			}
+			timeout, err := time.ParseDuration(value)
+			if err != nil {
+				return fmt.Errorf("invalid timeout value %q", value)
+			}
+			cfg.commandTimeout = timeout
+
+		default:
+			return fmt.Errorf("unknown exec option: %q", key)
+		}
+	}
+
+	return nil
+}
+
 func requireOptionValue(key, value string, hasValue bool) error {
 	if !hasValue || value == "" {
 		return fmt.Errorf("listen option %q requires a value", key)
@@ -310,69 +376,6 @@ func splitQuotedList(value string, sep rune) ([]string, error) {
 	}
 	parts = append(parts, part.String())
 	return parts, nil
-}
-
-func parseExec(cfg *config, spec string) error {
-	parts, err := splitQuotedList(spec, ',')
-	if err != nil {
-		return err
-	}
-	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
-		return errors.New("exec command must not be empty")
-	}
-
-	cmd, err := splitCommand(strings.TrimSpace(parts[0]))
-	if err != nil {
-		return fmt.Errorf("invalid exec specification: %w", err)
-	}
-	if len(cmd) == 0 || cmd[0] == "" {
-		return errors.New("exec command must not be empty")
-	}
-	cfg.cmdline = cmd
-
-	seenOptions := make(map[string]struct{}, len(parts)-1)
-	for _, rawOption := range parts[1:] {
-		option := strings.TrimSpace(rawOption)
-		if option == "" {
-			return errors.New("exec option must not be empty")
-		}
-
-		key, value, hasValue := strings.Cut(option, "=")
-		key = strings.ToLower(strings.TrimSpace(key))
-		value = strings.TrimSpace(value)
-		if _, exists := seenOptions[key]; exists {
-			return fmt.Errorf("exec option %q may only be specified once", key)
-		}
-		seenOptions[key] = struct{}{}
-
-		switch key {
-		case "stream":
-			if !hasValue || value == "" {
-				cfg.stream = true
-				continue
-			}
-			stream, err := strconv.ParseBool(value)
-			if err != nil {
-				return fmt.Errorf("invalid stream value: %q: %w", value, err)
-			}
-			cfg.stream = stream
-
-		case "timeout":
-			if err := requireOptionValue(key, value, hasValue); err != nil {
-				return err
-			}
-			timeout, err := time.ParseDuration(value)
-			if err != nil {
-				return fmt.Errorf("invalid timeout value %q", value)
-			}
-			cfg.commandTimeout = timeout
-
-		default:
-			return fmt.Errorf("unknown exec option: %q", key)
-		}
-	}
-
-	return nil
 }
 
 func splitCommand(value string) ([]string, error) {
@@ -499,31 +502,113 @@ type execHandler struct {
 	sem     chan struct{}
 }
 
-func (h *execHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	log.Printf("connected from %s: %s %s", r.RemoteAddr, r.Method, r.URL.RequestURI())
+func newID() string {
+	var b [16]byte
+	now := time.Now()
+	ms := uint64(now.UnixNano() / int64(time.Millisecond))
+	nsWithinMs := now.Nanosecond() % int(time.Millisecond)
+	randA := uint16((uint64(nsWithinMs) * 4096) / uint64(time.Millisecond))
+	binary.BigEndian.PutUint32(b[0:4], uint32(ms>>16))
+	binary.BigEndian.PutUint16(b[4:6], uint16(ms))
+	binary.BigEndian.PutUint16(b[6:8], randA)
+	b[6] = (b[6] & 0x0f) | 0x70
+	rand.Read(b[8:16])
+	b[8] = (b[8] & 0x3f) | 0x80
 
+	var out [36]byte
+	hex.Encode(out[0:8], b[0:4])
+	out[8] = '-'
+	hex.Encode(out[9:13], b[4:6])
+	out[13] = '-'
+	hex.Encode(out[14:18], b[6:8])
+	out[18] = '-'
+	hex.Encode(out[19:23], b[8:10])
+	out[23] = '-'
+	hex.Encode(out[24:36], b[10:16])
+	return string(out[:])
+}
+
+// custom response writer
+type hcResponseWriter struct {
+	http.ResponseWriter
+	status int
+	bytes  int64
+}
+
+func (w *hcResponseWriter) Header() http.Header {
+	return w.ResponseWriter.Header()
+}
+
+func (w *hcResponseWriter) WriteHeader(status int) {
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *hcResponseWriter) Write(b []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(b)
+	w.bytes += int64(n)
+	return n, err
+}
+
+func (w *hcResponseWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *hcResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, errors.New("http.Hijacker is not supported")
+}
+
+func (w *hcResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+func (h *execHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	id := r.Header.Get("X-Request-ID")
+	if id == "" {
+		id = newID()
+	}
+	log.Printf("[%v] request started, remote=%v, method=%v, path=%v",
+		id, r.RemoteAddr, r.Method, r.URL.RequestURI())
+	ctx := context.WithValue(r.Context(), ctxKeyID, id)
+	hcw := &hcResponseWriter{ResponseWriter: w}
+	startedAt := time.Now()
+
+	err := h.serve(ctx, r, hcw)
+
+	log.Printf("[%v] request completed, status=%v, duration=%v, bytes=%v, err=%v",
+		id, hcw.status, time.Since(startedAt), hcw.bytes, err)
+}
+
+func (h *execHandler) serve(ctx context.Context, r *http.Request, w *hcResponseWriter) error {
+	id := ctx.Value(ctxKeyID).(string)
 	if h.sem != nil {
 		select {
 		case h.sem <- struct{}{}:
 			defer func() { <-h.sem }()
 		default:
 			http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
-			return
+			return errors.New("too many requests")
 		}
 	}
 
-	ctx := context.WithValue(r.Context(), ctxSignalContext, h.rootCtx)
-	ctx = context.WithValue(ctx, ctxEnviron, buildCGIEnv(os.Environ(), r))
+	ctx = context.WithValue(ctx, ctxKeySignalCtx, h.rootCtx)
+	ctx = context.WithValue(ctx, ctxKeyEnviron, buildCGIEnv(os.Environ(), r))
 
 	if h.config.websocketMode >= 1 {
-		upgrade, status, key := isWebSocketRequest(r, w)
+		upgrade, err, key := isWebSocketRequest(r, w)
 		if upgrade {
-			if status == http.StatusOK {
-				serveWebSocket(ctx, h.config, key, w)
+			if err != nil {
+				log.Printf("[%v] websocket rejected, status=%v, reason=%v", id, err.status, err.reason)
+				http.Error(w, http.StatusText(err.status), err.status)
+				return errors.New(err.reason)
 			} else {
-				http.Error(w, http.StatusText(status), status)
+				return serveWebSocket(ctx, h.config, key, w)
 			}
-			return
 		}
 	}
 
@@ -534,13 +619,13 @@ func (h *execHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if r.ContentLength > h.config.maxBodyBytes {
 			http.Error(w, http.StatusText(http.StatusRequestEntityTooLarge),
 				http.StatusRequestEntityTooLarge)
-			return
+			return errors.New("request entity too large")
 		}
 		body = http.MaxBytesReader(w, r.Body, h.config.maxBodyBytes)
 	}
 	defer body.Close()
 
-	execCommand(context.WithValue(ctx, ctxApplyTimeout, struct{}{}), h.config, body, w)
+	return execCommand(ctx, h.config, body, w)
 }
 
 func buildCGIEnv(base []string, r *http.Request) []string {
@@ -715,7 +800,7 @@ func (b *limitedBuffer) Err() error {
 
 // for stream output
 type streamWriter struct {
-	writer  http.ResponseWriter
+	writer  *hcResponseWriter
 	err     error
 	started bool
 	onError func()
@@ -735,9 +820,7 @@ func (w *streamWriter) Write(data []byte) (int, error) {
 		}
 		return n, err
 	}
-	if f, ok := w.writer.(http.Flusher); ok {
-		f.Flush()
-	}
+	w.writer.Flush()
 	return n, nil
 }
 
@@ -751,28 +834,30 @@ func (w *streamWriter) Started() bool {
 
 // Command Process
 type commandProcess struct {
-	sigCtx  context.Context
-	ctx     context.Context
-	cancel  context.CancelFunc
-	cmd     *exec.Cmd
-	doneCh  chan struct{}
-	waitErr error
+	sigCtx   context.Context
+	ctx      context.Context
+	cancel   context.CancelFunc
+	cmd      *exec.Cmd
+	doneCh   chan struct{}
+	waitErr  error
+	duration time.Duration
+	exitCode int
 }
 
-func newCommandProcess(ctx context.Context, cfg *config) *commandProcess {
+func newCommandProcess(ctx context.Context, cfg *config, applyTimeout bool) *commandProcess {
 	var cmdCtx context.Context
 	var cancel context.CancelFunc
-	if ctx.Value(ctxApplyTimeout) != nil && cfg.commandTimeout > 0 {
+	if applyTimeout && cfg.commandTimeout > 0 {
 		cmdCtx, cancel = context.WithTimeout(ctx, cfg.commandTimeout)
 	} else {
 		cmdCtx, cancel = context.WithCancel(ctx)
 	}
 	cmd := exec.CommandContext(cmdCtx, cfg.cmdline[0], cfg.cmdline[1:]...)
-	cmd.Env = ctx.Value(ctxEnviron).([]string)
+	cmd.Env = ctx.Value(ctxKeyEnviron).([]string)
 	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	return &commandProcess{
-		sigCtx: ctx.Value(ctxSignalContext).(context.Context),
+		sigCtx: ctx.Value(ctxKeySignalCtx).(context.Context),
 		ctx:    cmdCtx,
 		cancel: cancel,
 		cmd:    cmd,
@@ -783,6 +868,9 @@ func (p *commandProcess) start() error {
 	if err := p.cmd.Start(); err != nil {
 		return err
 	}
+	startedAt := time.Now()
+	log.Printf("[%v] command started, pid=%v, cmd=%v",
+		p.ctx.Value(ctxKeyID).(string), p.cmd.Process.Pid, p.cmd.Args)
 
 	p.doneCh = make(chan struct{})
 	processDone := make(chan struct{})
@@ -801,12 +889,28 @@ func (p *commandProcess) start() error {
 			}
 		}
 		if err != nil && !errors.Is(err, syscall.ESRCH) {
-			log.Printf("kill process group failed: %v", err)
+			log.Printf("[%v] kill process group failed: %v", p.ctx.Value(ctxKeyID).(string), err)
 		}
 	}()
 
 	go func() {
 		p.waitErr = p.cmd.Wait()
+		p.duration = time.Since(startedAt)
+		if p.waitErr == nil {
+			p.exitCode = 0
+		} else if e, ok := p.waitErr.(*exec.ExitError); ok {
+			if w, ok := e.Sys().(syscall.WaitStatus); ok {
+				if s := w.Signal(); s > 0 {
+					p.exitCode = 127 + int(s)
+				} else {
+					p.exitCode = w.ExitStatus()
+				}
+			} else {
+				p.exitCode = e.ExitCode()
+			}
+		} else {
+			p.exitCode = 255
+		}
 		close(processDone)
 		<-watchDone
 		close(p.doneCh)
@@ -828,8 +932,9 @@ func (p *commandProcess) stop() {
 	p.cancel()
 }
 
-func execCommand(ctx context.Context, cfg *config, body io.Reader, w http.ResponseWriter) {
-	proc := newCommandProcess(ctx, cfg)
+func execCommand(ctx context.Context, cfg *config, body io.Reader, w *hcResponseWriter) error {
+	id := ctx.Value(ctxKeyID).(string)
+	proc := newCommandProcess(ctx, cfg, !cfg.stream)
 	defer proc.stop()
 
 	errReader := &errorTrackingReader{reader: body, onError: proc.stop}
@@ -846,7 +951,7 @@ func execCommand(ctx context.Context, cfg *config, body io.Reader, w http.Respon
 
 	if err := proc.start(); err != nil {
 		handleExecError(proc.ctx, w, err)
-		return
+		return err
 	}
 	cmdErr := proc.wait()
 
@@ -859,24 +964,29 @@ func execCommand(ctx context.Context, cfg *config, body io.Reader, w http.Respon
 		execErr = proc.ctx.Err()
 	} else if cmdErr != nil {
 		execErr = fmt.Errorf("command failed: %w", cmdErr)
+	} else {
+		log.Printf("[%v] command completed, pid=%v, exit=%v, duration=%v",
+			id, proc.cmd.Process.Pid, proc.exitCode, proc.duration)
 	}
 
 	if execErr != nil {
 		if s, ok := outWriter.(*streamWriter); ok && s.Started() {
-			log.Printf("exec failed after streaming response started: %v", execErr)
+			log.Printf("[%v] exec failed after streaming response started: %v", id, execErr)
+			w.status = http.StatusOK
 		} else {
 			handleExecError(ctx, w, execErr)
 		}
-		return
+		return execErr
 	}
 
-	if !cfg.stream {
-		writeResponse(proc.ctx, w, outWriter.(*limitedBuffer))
+	if cfg.stream {
+		return nil
 	}
+	return writeResponse(proc.ctx, w, outWriter.(*limitedBuffer))
 }
 
-func handleExecError(ctx context.Context, w http.ResponseWriter, err error) {
-	log.Printf("exec failed: %v", err)
+func handleExecError(ctx context.Context, w *hcResponseWriter, err error) {
+	log.Printf("[%v] exec failed: %v", ctx.Value(ctxKeyID).(string), err)
 	if !errors.Is(err, context.Canceled) || ctx.Err() == nil {
 		status := http.StatusBadGateway
 		// var maxBytesError *http.MaxBytesError
@@ -891,11 +1001,14 @@ func handleExecError(ctx context.Context, w http.ResponseWriter, err error) {
 	}
 }
 
-func writeResponse(ctx context.Context, w http.ResponseWriter, b *limitedBuffer) {
+func writeResponse(ctx context.Context, w *hcResponseWriter, b *limitedBuffer) error {
+	id := ctx.Value(ctxKeyID).(string)
 	resp, err := parseCGIResponse(b.buffer.Bytes())
 	if err != nil {
-		handleExecError(ctx, w, fmt.Errorf("parse CGI response: %w", err))
-		return
+		//handleExecError(ctx, w, fmt.Errorf("parse CGI response: %w", err))
+		log.Printf("[%v] parse GCI response failed: %v", id, err)
+		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
+		return err
 	}
 
 	for n, vs := range resp.headers {
@@ -911,9 +1024,10 @@ func writeResponse(ctx context.Context, w http.ResponseWriter, b *limitedBuffer)
 	if len(resp.body) > 0 {
 		_, err := w.Write(resp.body)
 		if err != nil {
-			log.Printf("write response failed: %v", err)
+			log.Printf("[%v] write response failed: %v", id, err)
 		}
 	}
+	return nil
 }
 
 type execResponse struct {
@@ -956,7 +1070,11 @@ func parseCGIResponse(data []byte) (*execResponse, error) {
 		return nil, errors.New("response contains multiple Status headers")
 	}
 	if len(statusValues) == 1 {
-		status, err = parseCGIStatus(statusValues[0])
+		fields := strings.Fields(statusValues[0])
+		if len(fields) == 0 {
+			return nil, errors.New("empty CGI Status header")
+		}
+		status, err = parseStatusCode(fields[0])
 		if err != nil {
 			return nil, err
 		}
@@ -1013,14 +1131,6 @@ func parseHTTPStatusLine(line string) (int, error) {
 	return parseStatusCode(parts[1])
 }
 
-func parseCGIStatus(value string) (int, error) {
-	fields := strings.Fields(value)
-	if len(fields) == 0 {
-		return 0, errors.New("empty CGI Status header")
-	}
-	return parseStatusCode(fields[0])
-}
-
 func parseStatusCode(value string) (int, error) {
 	if len(value) != 3 {
 		return 0, fmt.Errorf("invalid HTTP status code %q", value)
@@ -1055,42 +1165,51 @@ func sanitizeCGIHeaders(headers http.Header) {
 /////////////////////////////////////////////////////////////////////////////
 // WebSocket
 //
-func isWebSocketRequest(r *http.Request, w http.ResponseWriter) (bool, int, string) {
+type wsUpgradeError struct {
+	status int
+	reason string
+}
+
+func (e *wsUpgradeError) Error() string {
+	return e.reason
+}
+
+func isWebSocketRequest(r *http.Request, w *hcResponseWriter) (bool, *wsUpgradeError, string) {
 	if !headerContainsToken(r.Header.Values("Upgrade"), "websocket") {
-		return false, 0, ""
+		return false, nil, ""
 	}
 
 	if r.Method != http.MethodGet {
-		return true, http.StatusMethodNotAllowed, ""
+		return true, &wsUpgradeError{http.StatusMethodNotAllowed, "method not allowed"}, ""
 	}
 
 	if !headerContainsToken(r.Header.Values("Connection"), "Upgrade") {
-		return true, http.StatusBadRequest, ""
+		return true, &wsUpgradeError{http.StatusBadRequest, "missing Connection: Upgrade"}, ""
 	}
 
 	if !webSocketOriginAllowed(r) {
-		return true, http.StatusForbidden, ""
+		return true, &wsUpgradeError{http.StatusForbidden, "mismatched Origin"}, ""
 	}
 
 	if r.Header.Get("Sec-WebSocket-Version") != "13" {
 		w.Header().Set("Sec-WebSocket-Version", "13")
-		return true, http.StatusUpgradeRequired, ""
+		return true, &wsUpgradeError{http.StatusUpgradeRequired, "bad websocket version"}, ""
 	}
 
 	keys := r.Header.Values("Sec-WebSocket-Key")
 	if len(keys) != 1 {
-		return true, http.StatusBadRequest, ""
+		return true, &wsUpgradeError{http.StatusBadRequest, "multiple websocket keys"}, ""
 	}
 	key := strings.TrimSpace(keys[0])
 	if key == "" {
-		return true, http.StatusBadRequest, ""
+		return true, &wsUpgradeError{http.StatusBadRequest, "empty websocket key"}, ""
 	}
 	decoded, err := base64.StdEncoding.DecodeString(key)
 	if err != nil || len(decoded) != 16 {
-		return true, http.StatusBadRequest, ""
+		return true, &wsUpgradeError{http.StatusBadRequest, "bad websocket key"}, ""
 	}
 
-	return true, http.StatusOK, key
+	return true, nil, key
 }
 
 func headerContainsToken(values []string, wanted string) bool {
@@ -1328,16 +1447,11 @@ func (r *wsReader) unmaskPayload(p []byte) {
 	}
 }
 
-func serveWebSocket(ctx context.Context, cfg *config, key string, w http.ResponseWriter) {
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "WebSocket is not supported", http.StatusInternalServerError)
-		return
-	}
-
-	conn, rw, err := hijacker.Hijack()
+func serveWebSocket(ctx context.Context, cfg *config, key string, w *hcResponseWriter) error {
+	id := ctx.Value(ctxKeyID).(string)
+	conn, rw, err := w.Hijack()
 	if err != nil {
-		return
+		return err
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Time{})
@@ -1352,9 +1466,10 @@ func serveWebSocket(ctx context.Context, cfg *config, key string, w http.Respons
 		err = rw.Flush()
 	}
 	if err != nil {
-		log.Printf("Upgrade output failed: %v", err)
-		return
+		log.Printf("[%v] Upgrade output failed: %v", id, err)
+		return err
 	}
+	log.Printf("[%v] websocket upgraded", id)
 
 	var toPeer io.WriteCloser
 	var fromPeer io.Reader
@@ -1366,31 +1481,32 @@ func serveWebSocket(ctx context.Context, cfg *config, key string, w http.Respons
 		fromPeer = rw.Reader
 	}
 
-	pipeCommand(ctx, cfg, fromPeer, toPeer)
+	return pipeCommand(ctx, cfg, fromPeer, toPeer)
 }
 
-func pipeCommand(ctx context.Context, cfg *config, fromPeer io.Reader, toPeer io.WriteCloser) {
-	proc := newCommandProcess(ctx, cfg)
+func pipeCommand(ctx context.Context, cfg *config, fromPeer io.Reader, toPeer io.WriteCloser) error {
+	id := ctx.Value(ctxKeyID).(string)
+	proc := newCommandProcess(ctx, cfg, false)
 	defer proc.stop()
 
 	toCmd, err := proc.cmd.StdinPipe()
 	if err != nil {
-		log.Printf("command stdin pipe failed: %v", err)
-		return
+		log.Printf("[%v] command stdin pipe failed: %v", id, err)
+		return err
 	}
 
 	fromCmd, err := proc.cmd.StdoutPipe()
 	if err != nil {
-		log.Printf("command stdout pipe failed: %v", err)
+		log.Printf("[%v] command stdout pipe failed: %v", id, err)
 		toCmd.Close()
-		return
+		return err
 	}
 
 	if err := proc.start(); err != nil {
-		log.Printf("exec failed: %v", err)
+		log.Printf("[%v] exec failed: %v", id, err)
 		toCmd.Close()
 		fromCmd.Close()
-		return
+		return err
 	}
 
 	copyCh := make(chan error, 2)
@@ -1414,14 +1530,22 @@ func pipeCommand(ctx context.Context, cfg *config, fromPeer io.Reader, toPeer io
 	_ = fromCmd.Close()
 
 	<-copyCh
-	waitErr := proc.wait()
+	cmdErr := proc.wait()
 
 	if copyErr != nil && !errors.Is(copyErr, io.EOF) && !errors.Is(copyErr, os.ErrClosed) {
-		log.Printf("copy failed: %v", copyErr)
+		log.Printf("[%v] copy failed: %v", id, copyErr)
+		err = copyErr
 	}
-	if waitErr != nil && !errors.Is(proc.ctx.Err(), context.Canceled) {
-		log.Printf("command failed: %v", waitErr)
+	if cmdErr != nil && !errors.Is(proc.ctx.Err(), context.Canceled) {
+		log.Printf("[%v] command failed: %v", id, cmdErr)
+		if err == nil {
+			err = cmdErr
+		}
+	} else {
+		log.Printf("[%v] command completed, pid=%v, exit=%v, duration=%v",
+			proc.ctx.Value(ctxKeyID).(string), proc.cmd.Process.Pid, proc.exitCode, proc.duration)
 	}
+	return err
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -1470,9 +1594,10 @@ func runServer(cfg *config) error {
 		}
 		return srvErr
 	case <-sigCtx.Done():
-		log.Print("shutting down")
+		log.Printf("shutting down: %v", sigCtx.Err())
 	}
 
+	signaledAt := time.Now()
 	srvCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	if err := server.Shutdown(srvCtx); err != nil {
@@ -1485,6 +1610,7 @@ func runServer(cfg *config) error {
 	if srvErr != nil && !errors.Is(srvErr, http.ErrServerClosed) {
 		return srvErr
 	}
+	log.Printf("shutdown completed, duration=%v", time.Since(signaledAt))
 	return nil
 }
 
