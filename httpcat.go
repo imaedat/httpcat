@@ -603,16 +603,15 @@ func (h *execHandler) serve(ctx context.Context, r *http.Request, w *countingRes
 	ctx = context.WithValue(ctx, ctxKeyEnviron, buildCGIEnv(r))
 
 	if h.config.websocketMode >= 1 {
-		upgrade, status, key_or_msg := isWebSocketRequest(r)
-		if upgrade {
-			if status != http.StatusOK {
-				if status == http.StatusUpgradeRequired {
-					w.Header().Set("Sec-WebSocket-Version", "13")
-				}
-				http.Error(w, http.StatusText(status), status)
-				return errors.New(key_or_msg)
+		if status, key_or_msg := isWebSocketRequest(r); status > 0 {
+			if status == http.StatusOK {
+				return serveWebSocket(ctx, h.config, key_or_msg, w)
 			}
-			return serveWebSocket(ctx, h.config, key_or_msg, w)
+			if status == http.StatusUpgradeRequired {
+				w.Header().Set("Sec-WebSocket-Version", "13")
+			}
+			http.Error(w, http.StatusText(status), status)
+			return errors.New(key_or_msg)
 		}
 	}
 
@@ -1169,38 +1168,38 @@ func sanitizeCGIHeaders(headers http.Header) {
 /////////////////////////////////////////////////////////////////////////////
 // WebSocket
 //
-func isWebSocketRequest(r *http.Request) (bool, int, string) {
+func isWebSocketRequest(r *http.Request) (int, string) {
 	if !headerContainsToken(r.Header.Values("Upgrade"), "websocket") {
-		return false, 0, ""
+		return 0, ""
 	}
 
 	if r.Method != http.MethodGet {
-		return true, http.StatusMethodNotAllowed, "websocket: method not allowed"
+		return http.StatusMethodNotAllowed, "websocket: method not allowed"
 	}
 
 	if !headerContainsToken(r.Header.Values("Connection"), "Upgrade") {
-		return true, http.StatusBadRequest, "websocket: missing Connection: Upgrade"
+		return http.StatusBadRequest, "websocket: missing Connection: Upgrade"
 	}
 
 	if !webSocketOriginAllowed(r) {
-		return true, http.StatusForbidden, "websocket: mismatched Origin"
+		return http.StatusForbidden, "websocket: mismatched Origin"
 	}
 
 	if r.Header.Get("Sec-WebSocket-Version") != "13" {
-		return true, http.StatusUpgradeRequired, "websocket: invalid version"
+		return http.StatusUpgradeRequired, "websocket: invalid version"
 	}
 
 	keys := r.Header.Values("Sec-WebSocket-Key")
 	if len(keys) != 1 {
-		return true, http.StatusBadRequest, "websocket: empty/multiple keys"
+		return http.StatusBadRequest, "websocket: empty/multiple keys"
 	}
 	key := strings.TrimSpace(keys[0])
 	decoded, err := base64.StdEncoding.DecodeString(key)
 	if err != nil || len(decoded) != 16 {
-		return true, http.StatusBadRequest, "websocket: invalid key"
+		return http.StatusBadRequest, "websocket: invalid key"
 	}
 
-	return true, http.StatusOK, key
+	return http.StatusOK, key
 }
 
 func headerContainsToken(values []string, wanted string) bool {
