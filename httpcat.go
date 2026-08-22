@@ -22,7 +22,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -311,7 +310,7 @@ func parseExec(cfg *config, spec string) error {
 
 func requireOptionValue(key, value string, hasValue bool) error {
 	if !hasValue || value == "" {
-		return fmt.Errorf("listen option %q requires a value", key)
+		return fmt.Errorf("option %q requires a value", key)
 	}
 	return nil
 }
@@ -322,7 +321,7 @@ func parsePositiveValueLimit(key, value string, hasValue bool) (int64, error) {
 	}
 	limit, err := strconv.ParseInt(value, 10, 64)
 	if err != nil || limit <= 0 {
-		return 0, fmt.Errorf("listen option %q must be a positive value", key)
+		return 0, fmt.Errorf("option %q must be a positive value", key)
 	}
 	return limit, nil
 }
@@ -443,12 +442,26 @@ func buildTLSConfig(cfg *config) (*tls.Config, error) {
 		return tlsConfig, nil
 	}
 
-	clientCAs, err := loadClientCAs(cfg.caFile)
-	if err != nil {
-		return nil, err
-	}
 	tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
-	tlsConfig.ClientCAs = clientCAs
+	if cfg.caFile == "" {
+		var err error
+		tlsConfig.ClientCAs, err = x509.SystemCertPool()
+		if err != nil {
+			return nil, fmt.Errorf("load system CA pool: %w", err)
+		}
+		if tlsConfig.ClientCAs == nil {
+			tlsConfig.ClientCAs = x509.NewCertPool()
+		}
+	} else {
+		caPEM, err := os.ReadFile(cfg.caFile)
+		if err != nil {
+			return nil, fmt.Errorf("read CA file %q: %w", cfg.caFile, err)
+		}
+		tlsConfig.ClientCAs = x509.NewCertPool()
+		if !tlsConfig.ClientCAs.AppendCertsFromPEM(caPEM) {
+			return nil, fmt.Errorf("CA file %q does not contain a valid certificate", cfg.caFile)
+		}
+	}
 
 	if cfg.commonName != "" {
 		tlsConfig.VerifyConnection = func(state tls.ConnectionState) error {
@@ -470,29 +483,6 @@ func buildTLSConfig(cfg *config) (*tls.Config, error) {
 	return tlsConfig, nil
 }
 
-func loadClientCAs(caFile string) (*x509.CertPool, error) {
-	if caFile == "" {
-		pool, err := x509.SystemCertPool()
-		if err != nil {
-			return nil, fmt.Errorf("load system CA pool: %w", err)
-		}
-		if pool == nil {
-			pool = x509.NewCertPool()
-		}
-		return pool, nil
-	}
-
-	caPEM, err := os.ReadFile(caFile)
-	if err != nil {
-		return nil, fmt.Errorf("read CA file %q: %w", caFile, err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(caPEM) {
-		return nil, fmt.Errorf("CA file %q does not contain a valid certificate", caFile)
-	}
-	return pool, nil
-}
-
 /////////////////////////////////////////////////////////////////////////////
 // handler
 //
@@ -512,7 +502,9 @@ func newID() string {
 	binary.BigEndian.PutUint16(b[4:6], uint16(ms))
 	binary.BigEndian.PutUint16(b[6:8], randA)
 	b[6] = (b[6] & 0x0f) | 0x70
-	rand.Read(b[8:16])
+	if _, err := rand.Read(b[8:16]); err != nil {
+		panic(err)
+	}
 	b[8] = (b[8] & 0x3f) | 0x80
 
 	var out [36]byte
@@ -529,41 +521,46 @@ func newID() string {
 }
 
 // custom response writer
-type hcResponseWriter struct {
+type countingResponseWriter struct {
 	http.ResponseWriter
 	status int
 	bytes  int64
 }
 
-func (w *hcResponseWriter) Header() http.Header {
-	return w.ResponseWriter.Header()
-}
-
-func (w *hcResponseWriter) WriteHeader(status int) {
+func (w *countingResponseWriter) WriteHeader(status int) {
+	if w.status != 0 {
+		return
+	}
 	w.status = status
 	w.ResponseWriter.WriteHeader(status)
 }
 
-func (w *hcResponseWriter) Write(b []byte) (int, error) {
+func (w *countingResponseWriter) Write(b []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
 	n, err := w.ResponseWriter.Write(b)
 	w.bytes += int64(n)
 	return n, err
 }
 
-func (w *hcResponseWriter) Flush() {
+func (w *countingResponseWriter) Flush() {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
 }
 
-func (w *hcResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+func (w *countingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
 		return h.Hijack()
 	}
 	return nil, nil, errors.New("http.Hijacker is not supported")
 }
 
-func (w *hcResponseWriter) Unwrap() http.ResponseWriter {
+func (w *countingResponseWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
 }
 
@@ -575,40 +572,44 @@ func (h *execHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[%v] request started, remote=%v, method=%v, path=%v",
 		id, r.RemoteAddr, r.Method, r.URL.RequestURI())
 	ctx := context.WithValue(r.Context(), ctxKeyID, id)
-	hcw := &hcResponseWriter{ResponseWriter: w}
+	crw := &countingResponseWriter{ResponseWriter: w}
 	startedAt := time.Now()
 
-	err := h.serve(ctx, r, hcw)
-
-	log.Printf("[%v] request completed, status=%v, duration=%v, bytes=%v, err=%v",
-		id, hcw.status, time.Since(startedAt), hcw.bytes, err)
+	err := h.serve(ctx, r, crw)
+	result := "completed"
+	if 400 <= crw.status && crw.status < 500 {
+		result = "rejected"
+	} else if 500 <= crw.status {
+		result = "failed"
+	}
+	log.Printf("[%v] request %v, status=%v, duration=%v, bytes=%v, err=%v",
+		id, result, crw.status, time.Since(startedAt), crw.bytes, err)
 }
 
-func (h *execHandler) serve(ctx context.Context, r *http.Request, w *hcResponseWriter) error {
-	id := ctx.Value(ctxKeyID).(string)
+func (h *execHandler) serve(ctx context.Context, r *http.Request, w *countingResponseWriter) error {
 	if h.sem != nil {
 		select {
 		case h.sem <- struct{}{}:
 			defer func() { <-h.sem }()
 		default:
 			http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
-			return errors.New("too many requests")
+			return fmt.Errorf("too many requests (limit=%v)", h.config.maxConnection)
 		}
 	}
 
 	ctx = context.WithValue(ctx, ctxKeySignalCtx, h.rootCtx)
-	ctx = context.WithValue(ctx, ctxKeyEnviron, buildCGIEnv(os.Environ(), r))
+	ctx = context.WithValue(ctx, ctxKeyEnviron, buildCGIEnv(r))
 
 	if h.config.websocketMode >= 1 {
-		upgrade, err, key := isWebSocketRequest(r, w)
+		upgrade, status, key_or_err := isWebSocketRequest(r, w)
 		if upgrade {
-			if err != nil {
-				log.Printf("[%v] websocket rejected, status=%v, reason=%v", id, err.status, err.reason)
-				http.Error(w, http.StatusText(err.status), err.status)
-				return errors.New(err.reason)
-			} else {
-				return serveWebSocket(ctx, h.config, key, w)
+			if status != http.StatusOK {
+				log.Printf("[%v] websocket rejected, status=%v, reason=%v",
+					ctx.Value(ctxKeyID).(string), status, key_or_err)
+				http.Error(w, http.StatusText(status), status)
+				return errors.New(key_or_err)
 			}
+			return serveWebSocket(ctx, h.config, key_or_err, w)
 		}
 	}
 
@@ -619,7 +620,8 @@ func (h *execHandler) serve(ctx context.Context, r *http.Request, w *hcResponseW
 		if r.ContentLength > h.config.maxBodyBytes {
 			http.Error(w, http.StatusText(http.StatusRequestEntityTooLarge),
 				http.StatusRequestEntityTooLarge)
-			return errors.New("request entity too large")
+			return fmt.Errorf("request entity too large (content_length=%v, limit=%v)",
+				r.ContentLength, h.config.maxBodyBytes)
 		}
 		body = http.MaxBytesReader(w, r.Body, h.config.maxBodyBytes)
 	}
@@ -628,7 +630,7 @@ func (h *execHandler) serve(ctx context.Context, r *http.Request, w *hcResponseW
 	return execCommand(ctx, h.config, body, w)
 }
 
-func buildCGIEnv(base []string, r *http.Request) []string {
+func buildCGIEnv(r *http.Request) []string {
 	env := make(map[string]string, 32)
 	env["GATEWAY_INTERFACE"] = "CGI/1.1"
 	env["SERVER_SOFTWARE"] = "httpcat"
@@ -672,14 +674,9 @@ func buildCGIEnv(base []string, r *http.Request) []string {
 		env["HTTPS"] = "off"
 	}
 
-	headerNames := make([]string, 0, len(r.Header))
 	for name := range r.Header {
-		headerNames = append(headerNames, name)
-	}
-	sort.Strings(headerNames)
-	for _, name := range headerNames {
-		envName := "HTTP_" + strings.ToUpper(strings.ReplaceAll(name, "-", "_"))
-		if envName == "HTTP_CONTENT_TYPE" || envName == "HTTP_CONTENT_LENGTH" || envName == "HTTP_PROXY" {
+		key := "HTTP_" + strings.ToUpper(strings.ReplaceAll(name, "-", "_"))
+		if key == "HTTP_CONTENT_TYPE" || key == "HTTP_CONTENT_LENGTH" || key == "HTTP_PROXY" {
 			continue
 		}
 		sep := ", "
@@ -687,14 +684,25 @@ func buildCGIEnv(base []string, r *http.Request) []string {
 			sep = "; "
 		}
 		value := strings.Join(r.Header.Values(name), sep)
-		if existing, ok := env[envName]; ok && existing != "" {
-			env[envName] = existing + sep + value
+		if existing, ok := env[key]; ok && existing != "" {
+			env[key] = existing + sep + value
 		} else {
-			env[envName] = value
+			env[key] = value
 		}
 	}
 
-	return mergeEnv(base, env)
+	baseEnv := os.Environ()
+	result := make([]string, 0, len(baseEnv)+len(env))
+	for _, entry := range baseEnv {
+		key, _, found := strings.Cut(entry, "=")
+		if found && !isCGIEnvKey(key) {
+			result = append(result, entry)
+		}
+	}
+	for key, value := range env {
+		result = append(result, key+"="+value)
+	}
+	return result
 }
 
 func splitHostPort(addr string) (string, string) {
@@ -703,26 +711,6 @@ func splitHostPort(addr string) (string, string) {
 		return host, port
 	}
 	return strings.Trim(addr, "[]"), ""
-}
-
-func mergeEnv(base []string, env map[string]string) []string {
-	result := make([]string, 0, len(base)+len(env))
-	for _, entry := range base {
-		key, _, found := strings.Cut(entry, "=")
-		if found && !isCGIEnvKey(key) {
-			result = append(result, entry)
-		}
-	}
-
-	keys := make([]string, 0, len(env))
-	for key := range env {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		result = append(result, key+"="+env[key])
-	}
-	return result
 }
 
 func isCGIEnvKey(key string) bool {
@@ -763,44 +751,56 @@ func (r *errorTrackingReader) Read(buffer []byte) (int, error) {
 type outputWriter interface {
 	io.Writer
 	Err() error
+	BytesOut() int64
 }
 
 // for normal output
-type limitedBuffer struct {
+type bufferWriter struct {
 	buffer  bytes.Buffer
 	limit   int64
+	bytes   int64
 	err     error
 	onLimit func()
 }
 
-func (b *limitedBuffer) Write(data []byte) (int, error) {
+func (b *bufferWriter) Write(data []byte) (int, error) {
 	if b.limit == 0 {
-		return b.buffer.Write(data)
+		n, err := b.buffer.Write(data)
+		b.bytes += int64(n)
+		return n, err
 	}
 
 	remaining := b.limit - int64(b.buffer.Len())
 	if int64(len(data)) <= remaining {
-		return b.buffer.Write(data)
+		n, err := b.buffer.Write(data)
+		b.bytes += int64(n)
+		return n, err
 	}
 
 	written := 0
 	if remaining > 0 {
 		written, _ = b.buffer.Write(data[:int(remaining)])
 	}
-	b.err = errors.New("exec output exceeds configured limit")
+	b.err = fmt.Errorf("exec output too large (limit=%v)", b.limit)
 	if b.onLimit != nil {
 		b.onLimit()
 	}
+	b.bytes += int64(written)
 	return written, b.err
 }
 
-func (b *limitedBuffer) Err() error {
+func (b *bufferWriter) Err() error {
 	return b.err
+}
+
+func (b *bufferWriter) BytesOut() int64 {
+	return b.bytes
 }
 
 // for stream output
 type streamWriter struct {
-	writer  *hcResponseWriter
+	writer  *countingResponseWriter
+	bytes   int64
 	err     error
 	started bool
 	onError func()
@@ -811,6 +811,7 @@ func (w *streamWriter) Write(data []byte) (int, error) {
 		w.started = true
 	}
 	n, err := w.writer.Write(data)
+	w.bytes += int64(n)
 	if err != nil {
 		if w.err == nil {
 			w.err = err
@@ -826,6 +827,10 @@ func (w *streamWriter) Write(data []byte) (int, error) {
 
 func (w *streamWriter) Err() error {
 	return w.err
+}
+
+func (w *streamWriter) BytesOut() int64 {
+	return w.bytes
 }
 
 func (w *streamWriter) Started() bool {
@@ -864,7 +869,7 @@ func newCommandProcess(ctx context.Context, cfg *config, applyTimeout bool) *com
 	}
 }
 
-func (p *commandProcess) start() error {
+func (p *commandProcess) Start() error {
 	if err := p.cmd.Start(); err != nil {
 		return err
 	}
@@ -919,41 +924,40 @@ func (p *commandProcess) start() error {
 	return nil
 }
 
-func (p *commandProcess) done() <-chan struct{} {
+func (p *commandProcess) Done() <-chan struct{} {
 	return p.doneCh
 }
 
-func (p *commandProcess) wait() error {
+func (p *commandProcess) Wait() error {
 	<-p.doneCh
 	return p.waitErr
 }
 
-func (p *commandProcess) stop() {
+func (p *commandProcess) Stop() {
 	p.cancel()
 }
 
-func execCommand(ctx context.Context, cfg *config, body io.Reader, w *hcResponseWriter) error {
-	id := ctx.Value(ctxKeyID).(string)
+func execCommand(ctx context.Context, cfg *config, body io.Reader, w *countingResponseWriter) error {
 	proc := newCommandProcess(ctx, cfg, !cfg.stream)
-	defer proc.stop()
+	defer proc.Stop()
 
-	errReader := &errorTrackingReader{reader: body, onError: proc.stop}
+	errReader := &errorTrackingReader{reader: body, onError: proc.Stop}
 	proc.cmd.Stdin = errReader
 
 	var outWriter outputWriter
 	if cfg.stream {
-		outWriter = &streamWriter{writer: w, onError: proc.stop}
+		outWriter = &streamWriter{writer: w, onError: proc.Stop}
 		w.Header().Set("Content-Type", "application/octet-stream")
 	} else {
-		outWriter = &limitedBuffer{limit: cfg.maxOutputBytes, onLimit: proc.stop}
+		outWriter = &bufferWriter{limit: cfg.maxOutputBytes, onLimit: proc.Stop}
 	}
 	proc.cmd.Stdout = outWriter
 
-	if err := proc.start(); err != nil {
-		handleExecError(proc.ctx, w, err)
+	if err := proc.Start(); err != nil {
+		log.Printf("[%v] exec failed, reason=%v", ctx.Value(ctxKeyID).(string), err)
 		return err
 	}
-	cmdErr := proc.wait()
+	cmdErr := proc.Wait()
 
 	var execErr error
 	if outWriter.Err() != nil {
@@ -965,16 +969,17 @@ func execCommand(ctx context.Context, cfg *config, body io.Reader, w *hcResponse
 	} else if cmdErr != nil {
 		execErr = fmt.Errorf("command failed: %w", cmdErr)
 	} else {
-		log.Printf("[%v] command completed, pid=%v, exit=%v, duration=%v",
-			id, proc.cmd.Process.Pid, proc.exitCode, proc.duration)
+		log.Printf("[%v] command completed, pid=%v, exit=%v, duration=%v, bytes_out=%v",
+			ctx.Value(ctxKeyID).(string), proc.cmd.Process.Pid, proc.exitCode, proc.duration,
+			outWriter.BytesOut())
 	}
 
 	if execErr != nil {
 		if s, ok := outWriter.(*streamWriter); ok && s.Started() {
-			log.Printf("[%v] exec failed after streaming response started: %v", id, execErr)
-			w.status = http.StatusOK
+			log.Printf("[%v] exec failed after streaming response started: %v",
+				ctx.Value(ctxKeyID).(string), execErr)
 		} else {
-			handleExecError(ctx, w, execErr)
+			handleExecError(proc.ctx, w, execErr)
 		}
 		return execErr
 	}
@@ -982,11 +987,11 @@ func execCommand(ctx context.Context, cfg *config, body io.Reader, w *hcResponse
 	if cfg.stream {
 		return nil
 	}
-	return writeResponse(proc.ctx, w, outWriter.(*limitedBuffer))
+	return writeResponse(proc.ctx, w, outWriter.(*bufferWriter))
 }
 
-func handleExecError(ctx context.Context, w *hcResponseWriter, err error) {
-	log.Printf("[%v] exec failed: %v", ctx.Value(ctxKeyID).(string), err)
+func handleExecError(ctx context.Context, w *countingResponseWriter, err error) {
+	log.Printf("[%v] command failed, reason=%v", ctx.Value(ctxKeyID).(string), err)
 	if !errors.Is(err, context.Canceled) || ctx.Err() == nil {
 		status := http.StatusBadGateway
 		// var maxBytesError *http.MaxBytesError
@@ -1001,12 +1006,10 @@ func handleExecError(ctx context.Context, w *hcResponseWriter, err error) {
 	}
 }
 
-func writeResponse(ctx context.Context, w *hcResponseWriter, b *limitedBuffer) error {
-	id := ctx.Value(ctxKeyID).(string)
+func writeResponse(ctx context.Context, w *countingResponseWriter, b *bufferWriter) error {
 	resp, err := parseCGIResponse(b.buffer.Bytes())
 	if err != nil {
-		//handleExecError(ctx, w, fmt.Errorf("parse CGI response: %w", err))
-		log.Printf("[%v] parse GCI response failed: %v", id, err)
+		log.Printf("[%v] parse GCI response failed: %v", ctx.Value(ctxKeyID).(string), err)
 		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
 		return err
 	}
@@ -1024,7 +1027,7 @@ func writeResponse(ctx context.Context, w *hcResponseWriter, b *limitedBuffer) e
 	if len(resp.body) > 0 {
 		_, err := w.Write(resp.body)
 		if err != nil {
-			log.Printf("[%v] write response failed: %v", id, err)
+			log.Printf("[%v] write response failed: %v", ctx.Value(ctxKeyID).(string), err)
 		}
 	}
 	return nil
@@ -1044,7 +1047,14 @@ func parseCGIResponse(data []byte) (*execResponse, error) {
 
 	hasStatusLine, status := false, http.StatusOK
 	if firstLine, remainder := takeFirstLine(headerPart); strings.HasPrefix(firstLine, "HTTP/") {
-		parsedStatus, err := parseHTTPStatusLine(firstLine)
+		parts := strings.SplitN(firstLine, " ", 3)
+		if len(parts) < 2 {
+			return nil, fmt.Errorf("invalid HTTP status line %q", firstLine)
+		}
+		if _, _, ok := http.ParseHTTPVersion(parts[0]); !ok {
+			return nil, fmt.Errorf("invalid HTTP version in status line %q", firstLine)
+		}
+		parsedStatus, err := parseStatusCode(parts[1])
 		if err != nil {
 			return nil, err
 		}
@@ -1120,17 +1130,6 @@ func takeFirstLine(data []byte) (string, []byte) {
 	return line, data[lineEnd+1:]
 }
 
-func parseHTTPStatusLine(line string) (int, error) {
-	parts := strings.SplitN(line, " ", 3)
-	if len(parts) < 2 {
-		return 0, fmt.Errorf("invalid HTTP status line %q", line)
-	}
-	if _, _, ok := http.ParseHTTPVersion(parts[0]); !ok {
-		return 0, fmt.Errorf("invalid HTTP version in status line %q", line)
-	}
-	return parseStatusCode(parts[1])
-}
-
 func parseStatusCode(value string) (int, error) {
 	if len(value) != 3 {
 		return 0, fmt.Errorf("invalid HTTP status code %q", value)
@@ -1165,51 +1164,42 @@ func sanitizeCGIHeaders(headers http.Header) {
 /////////////////////////////////////////////////////////////////////////////
 // WebSocket
 //
-type wsUpgradeError struct {
-	status int
-	reason string
-}
-
-func (e *wsUpgradeError) Error() string {
-	return e.reason
-}
-
-func isWebSocketRequest(r *http.Request, w *hcResponseWriter) (bool, *wsUpgradeError, string) {
+func isWebSocketRequest(r *http.Request, w *countingResponseWriter) (bool, int, string) {
 	if !headerContainsToken(r.Header.Values("Upgrade"), "websocket") {
-		return false, nil, ""
+		return false, 0, ""
 	}
 
 	if r.Method != http.MethodGet {
-		return true, &wsUpgradeError{http.StatusMethodNotAllowed, "method not allowed"}, ""
+		return true, http.StatusMethodNotAllowed, "method not allowed"
 	}
 
 	if !headerContainsToken(r.Header.Values("Connection"), "Upgrade") {
-		return true, &wsUpgradeError{http.StatusBadRequest, "missing Connection: Upgrade"}, ""
+		return true, http.StatusBadRequest, "missing Connection: Upgrade"
 	}
 
 	if !webSocketOriginAllowed(r) {
-		return true, &wsUpgradeError{http.StatusForbidden, "mismatched Origin"}, ""
+		return true, http.StatusForbidden, "mismatched Origin"
 	}
 
 	if r.Header.Get("Sec-WebSocket-Version") != "13" {
 		w.Header().Set("Sec-WebSocket-Version", "13")
-		return true, &wsUpgradeError{http.StatusUpgradeRequired, "bad websocket version"}, ""
+		return true, http.StatusUpgradeRequired, "bad websocket version"
 	}
 
 	keys := r.Header.Values("Sec-WebSocket-Key")
 	if len(keys) != 1 {
-		return true, &wsUpgradeError{http.StatusBadRequest, "multiple websocket keys"}, ""
+		return true, http.StatusBadRequest, "multiple websocket keys"
 	}
 	key := strings.TrimSpace(keys[0])
 	if key == "" {
-		return true, &wsUpgradeError{http.StatusBadRequest, "empty websocket key"}, ""
+		return true, http.StatusBadRequest, "empty websocket key"
 	}
 	decoded, err := base64.StdEncoding.DecodeString(key)
 	if err != nil || len(decoded) != 16 {
-		return true, &wsUpgradeError{http.StatusBadRequest, "bad websocket key"}, ""
+		return true, http.StatusBadRequest, "bad websocket key"
 	}
 
-	return true, nil, key
+	return true, http.StatusOK, key
 }
 
 func headerContainsToken(values []string, wanted string) bool {
@@ -1251,13 +1241,36 @@ func webSocketOriginAllowed(r *http.Request) bool {
 	return strings.EqualFold(u.Hostname(), host) && originPort == port
 }
 
-// writer for websocket
-type wsWriter struct {
-	to io.Writer
-	mu sync.Mutex
+// websocket writer / reader
+type countingWriter interface {
+	io.WriteCloser
+	BytesOut() int64
 }
 
-func (w *wsWriter) Close() error {
+type wsRawWriter struct {
+	io.WriteCloser
+	bytes int64
+}
+
+func (w *wsRawWriter) Write(b []byte) (int, error) {
+	n, err := w.WriteCloser.Write(b)
+	w.bytes += int64(n)
+	return n, err
+}
+
+func (w *wsRawWriter) BytesOut() int64 {
+	return w.bytes
+}
+
+// TODO? countingReader
+
+type wsPayloadWriter struct {
+	to    io.Writer
+	bytes int64
+	mu    sync.Mutex
+}
+
+func (w *wsPayloadWriter) Close() error {
 	if c, ok := w.to.(io.Closer); ok {
 		if err := c.Close(); err != nil {
 			return err
@@ -1266,26 +1279,24 @@ func (w *wsWriter) Close() error {
 	return nil
 }
 
-func (w *wsWriter) Write(buffer []byte) (int, error) {
+func (w *wsPayloadWriter) Write(buffer []byte) (int, error) {
 	if err := w.WriteFrame(0x2, buffer); err != nil {
 		return 0, err
 	}
 	return len(buffer), nil
 }
 
-func (w *wsWriter) WriteFrame(opcode byte, payload []byte) error {
+func (w *wsPayloadWriter) WriteFrame(opcode byte, payload []byte) error {
 	var hdr [10]byte
 	hdr[0] = 0x80 | opcode
 	n := 2
-
 	length := len(payload)
 	switch {
 	case length <= 125:
 		hdr[1] = byte(length)
 	case length <= 0xffff:
 		hdr[1] = 126
-		hdr[2] = byte(length >> 8)
-		hdr[3] = byte(length)
+		binary.BigEndian.PutUint16(hdr[2:4], uint16(length))
 		n = 4
 	default:
 		hdr[1] = 127
@@ -1296,37 +1307,45 @@ func (w *wsWriter) WriteFrame(opcode byte, payload []byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if err := w.writeFull(hdr[:n]); err != nil {
+	if _, err := w.writeFull(hdr[:n]); err != nil {
 		return err
 	}
-	return w.writeFull(payload)
+	written, err := w.writeFull(payload)
+	w.bytes += written
+	return err
 }
 
-func (w *wsWriter) writeFull(b []byte) error {
+func (w *wsPayloadWriter) writeFull(b []byte) (int64, error) {
+	var total int64 = 0
 	for len(b) > 0 {
 		n, err := w.to.Write(b)
+		total += int64(n)
 		if err != nil {
-			return err
+			return total, err
 		}
 		if n == 0 {
-			return io.ErrShortWrite
+			return total, io.ErrShortWrite
 		}
 		b = b[n:]
 	}
-	return nil
+	return total, nil
 }
 
-// reader for websocket
-type wsReader struct {
+func (w *wsPayloadWriter) BytesOut() int64 {
+	return w.bytes
+}
+
+type wsPayloadReader struct {
 	from       io.Reader
-	to         *wsWriter
+	to         *wsPayloadWriter
 	remaining  int64
 	mask       [4]byte
 	maskIdx    uint8
 	fragmented bool
+	bytes      int64
 }
 
-func (r *wsReader) Read(buffer []byte) (int, error) {
+func (r *wsPayloadReader) Read(buffer []byte) (int, error) {
 	if r.remaining == 0 {
 		for {
 			isDataFrame, err := r.readHeader()
@@ -1351,7 +1370,7 @@ func (r *wsReader) Read(buffer []byte) (int, error) {
 	return n, err
 }
 
-func (r *wsReader) readHeader() (bool, error) {
+func (r *wsPayloadReader) readHeader() (bool, error) {
 	var hdr [2]byte
 	if _, err := io.ReadFull(r.from, hdr[:]); err != nil {
 		return false, err
@@ -1364,10 +1383,7 @@ func (r *wsReader) readHeader() (bool, error) {
 		return false, errors.New("websocket: client frame not masked")
 	}
 
-	fin := hdr[0]&0x80 != 0
-	opcode := hdr[0] & 0x0f
 	length := uint64(hdr[1] & 0x7f)
-
 	switch length {
 	case 126:
 		var buf [2]byte
@@ -1397,6 +1413,12 @@ func (r *wsReader) readHeader() (bool, error) {
 	}
 	r.maskIdx = 0
 
+	return r.handleOpcode(hdr[0], length)
+}
+
+func (r *wsPayloadReader) handleOpcode(firstByte byte, length uint64) (bool, error) {
+	fin := firstByte&0x80 != 0
+	opcode := firstByte & 0x0f
 	switch opcode {
 	case 0x0:
 		if !r.fragmented {
@@ -1407,7 +1429,25 @@ func (r *wsReader) readHeader() (bool, error) {
 			return false, errors.New("websocket: new data frame during fragmented message")
 		}
 	case 0x8, 0x9, 0xa:
-		return false, r.handleCtrlFrame(fin, opcode, length)
+		if !fin || length == 1 || length > 125 {
+			return false, errors.New("websocket: invalid control frame")
+		}
+		p := make([]byte, length)
+		if _, err := io.ReadFull(r.from, p); err != nil {
+			return false, err
+		}
+		r.unmaskPayload(p)
+
+		switch opcode {
+		case 0x8:
+			_ = r.to.WriteFrame(0x8, p)
+			return false, io.EOF
+		case 0x9:
+			if err := r.to.WriteFrame(0xa, p); err != nil {
+				return false, err
+			}
+		}
+		return false, nil
 	default:
 		return false, errors.New("websocket: unsupported opcode")
 	}
@@ -1417,38 +1457,16 @@ func (r *wsReader) readHeader() (bool, error) {
 	return true, nil
 }
 
-func (r *wsReader) handleCtrlFrame(fin bool, opcode byte, payloadLen uint64) error {
-	if !fin || payloadLen == 1 || payloadLen > 125 {
-		return errors.New("websocket: invalid control frame")
-	}
-
-	p := make([]byte, payloadLen)
-	if _, err := io.ReadFull(r.from, p); err != nil {
-		return err
-	}
-	r.unmaskPayload(p)
-
-	switch opcode {
-	case 0x8:
-		_ = r.to.WriteFrame(0x8, p)
-		return io.EOF
-	case 0x9:
-		if err := r.to.WriteFrame(0xa, p); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (r *wsReader) unmaskPayload(p []byte) {
+func (r *wsPayloadReader) unmaskPayload(p []byte) {
 	for i := 0; i < len(p); i, r.maskIdx = i+1, r.maskIdx+1 {
 		r.maskIdx &= 3
 		p[i] ^= r.mask[r.maskIdx]
 	}
+	r.bytes += int64(len(p))
 }
 
-func serveWebSocket(ctx context.Context, cfg *config, key string, w *hcResponseWriter) error {
-	id := ctx.Value(ctxKeyID).(string)
+// websocket serve entry
+func serveWebSocket(ctx context.Context, cfg *config, key string, w *countingResponseWriter) error {
 	conn, rw, err := w.Hijack()
 	if err != nil {
 		return err
@@ -1466,84 +1484,82 @@ func serveWebSocket(ctx context.Context, cfg *config, key string, w *hcResponseW
 		err = rw.Flush()
 	}
 	if err != nil {
-		log.Printf("[%v] Upgrade output failed: %v", id, err)
+		log.Printf("[%v] Upgrade output failed: %v", ctx.Value(ctxKeyID).(string), err)
 		return err
 	}
-	log.Printf("[%v] websocket upgraded", id)
+	log.Printf("[%v] websocket upgraded", ctx.Value(ctxKeyID).(string))
+	w.status = http.StatusSwitchingProtocols
 
-	var toPeer io.WriteCloser
-	var fromPeer io.Reader
 	if cfg.websocketMode >= 2 {
-		toPeer = &wsWriter{to: conn}
-		fromPeer = &wsReader{from: rw.Reader, to: toPeer.(*wsWriter)}
+		toPeer := &wsPayloadWriter{to: conn}
+		return pipeCommand(ctx, cfg, &wsPayloadReader{from: rw.Reader, to: toPeer}, toPeer)
 	} else {
-		toPeer = conn
-		fromPeer = rw.Reader
+		return pipeCommand(ctx, cfg, rw.Reader, &wsRawWriter{WriteCloser: conn})
 	}
-
-	return pipeCommand(ctx, cfg, fromPeer, toPeer)
 }
 
-func pipeCommand(ctx context.Context, cfg *config, fromPeer io.Reader, toPeer io.WriteCloser) error {
-	id := ctx.Value(ctxKeyID).(string)
+func pipeCommand(ctx context.Context, cfg *config, fromPeer io.Reader, toPeer countingWriter) error {
 	proc := newCommandProcess(ctx, cfg, false)
-	defer proc.stop()
+	defer proc.Stop()
 
 	toCmd, err := proc.cmd.StdinPipe()
 	if err != nil {
-		log.Printf("[%v] command stdin pipe failed: %v", id, err)
+		log.Printf("[%v] command stdin pipe failed: %v", ctx.Value(ctxKeyID).(string), err)
 		return err
 	}
+	defer toCmd.Close()
 
 	fromCmd, err := proc.cmd.StdoutPipe()
 	if err != nil {
-		log.Printf("[%v] command stdout pipe failed: %v", id, err)
-		toCmd.Close()
+		log.Printf("[%v] command stdout pipe failed: %v", ctx.Value(ctxKeyID).(string), err)
+		return err
+	}
+	defer fromCmd.Close()
+
+	if err := proc.Start(); err != nil {
+		log.Printf("[%v] exec failed, reason=%v", ctx.Value(ctxKeyID).(string), err)
 		return err
 	}
 
-	if err := proc.start(); err != nil {
-		log.Printf("[%v] exec failed: %v", id, err)
-		toCmd.Close()
-		fromCmd.Close()
-		return err
-	}
-
+	var bytes_in, bytes_out int64
 	copyCh := make(chan error, 2)
 	go func() {
-		_, err := io.Copy(toCmd, fromPeer)
+		var err error
+		bytes_in, err = io.Copy(toCmd, fromPeer)
 		copyCh <- err
 	}()
 	go func() {
-		_, err := io.Copy(toPeer, fromCmd)
+		var err error
+		bytes_out, err = io.Copy(toPeer, fromCmd)
 		if err == nil && cfg.websocketMode >= 2 {
-			toPeer.(*wsWriter).WriteFrame(0x8, []byte{0x03, 0xe8})
+			toPeer.(*wsPayloadWriter).WriteFrame(0x8, []byte{0x03, 0xe8})
 		}
 		copyCh <- err
 	}()
 
 	copyErr := <-copyCh
-	proc.stop()
+	proc.Stop()
 
 	_ = toPeer.Close()
 	_ = toCmd.Close()
 	_ = fromCmd.Close()
 
 	<-copyCh
-	cmdErr := proc.wait()
+	cmdErr := proc.Wait()
 
 	if copyErr != nil && !errors.Is(copyErr, io.EOF) && !errors.Is(copyErr, os.ErrClosed) {
-		log.Printf("[%v] copy failed: %v", id, copyErr)
+		log.Printf("[%v] copy failed, reason=%v", ctx.Value(ctxKeyID).(string), copyErr)
 		err = copyErr
 	}
 	if cmdErr != nil && !errors.Is(proc.ctx.Err(), context.Canceled) {
-		log.Printf("[%v] command failed: %v", id, cmdErr)
+		log.Printf("[%v] command failed, reason=%v", ctx.Value(ctxKeyID).(string), cmdErr)
 		if err == nil {
 			err = cmdErr
 		}
 	} else {
-		log.Printf("[%v] command completed, pid=%v, exit=%v, duration=%v",
-			proc.ctx.Value(ctxKeyID).(string), proc.cmd.Process.Pid, proc.exitCode, proc.duration)
+		log.Printf("[%v] command completed, pid=%v, exit=%v, duration=%v, bytes_in=%v, bytes_out=%v",
+			proc.ctx.Value(ctxKeyID).(string), proc.cmd.Process.Pid, proc.exitCode, proc.duration,
+			bytes_in, bytes_out)
 	}
 	return err
 }
