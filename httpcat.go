@@ -502,9 +502,7 @@ func newID() string {
 	binary.BigEndian.PutUint16(b[4:6], uint16(ms))
 	binary.BigEndian.PutUint16(b[6:8], randA)
 	b[6] = (b[6] & 0x0f) | 0x70
-	if _, err := rand.Read(b[8:16]); err != nil {
-		panic(err)
-	}
+	rand.Read(b[8:16])
 	b[8] = (b[8] & 0x3f) | 0x80
 
 	var out [36]byte
@@ -553,6 +551,10 @@ func (w *countingResponseWriter) Flush() {
 	}
 }
 
+func (w *countingResponseWriter) Bytes() int64 {
+	return w.bytes
+}
+
 func (w *countingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
 		return h.Hijack()
@@ -577,13 +579,13 @@ func (h *execHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	err := h.serve(ctx, r, crw)
 	result := "completed"
+	var msg string
 	if 400 <= crw.status && crw.status < 500 {
 		result = "rejected"
-	} else if 500 <= crw.status {
-		result = "failed"
+		msg = fmt.Sprintf(", err=%v", err)
 	}
-	log.Printf("[%v] request %v, status=%v, duration=%v, bytes=%v, err=%v",
-		id, result, crw.status, time.Since(startedAt), crw.bytes, err)
+	log.Printf("[%v] request %v, status=%v, duration=%v, bytes_transferred=%v%v",
+		id, result, crw.status, time.Since(startedAt), crw.Bytes(), msg)
 }
 
 func (h *execHandler) serve(ctx context.Context, r *http.Request, w *countingResponseWriter) error {
@@ -601,15 +603,16 @@ func (h *execHandler) serve(ctx context.Context, r *http.Request, w *countingRes
 	ctx = context.WithValue(ctx, ctxKeyEnviron, buildCGIEnv(r))
 
 	if h.config.websocketMode >= 1 {
-		upgrade, status, key_or_err := isWebSocketRequest(r, w)
+		upgrade, status, key_or_msg := isWebSocketRequest(r)
 		if upgrade {
 			if status != http.StatusOK {
-				log.Printf("[%v] websocket rejected, status=%v, reason=%v",
-					ctx.Value(ctxKeyID).(string), status, key_or_err)
+				if status == http.StatusUpgradeRequired {
+					w.Header().Set("Sec-WebSocket-Version", "13")
+				}
 				http.Error(w, http.StatusText(status), status)
-				return errors.New(key_or_err)
+				return errors.New(key_or_msg)
 			}
-			return serveWebSocket(ctx, h.config, key_or_err, w)
+			return serveWebSocket(ctx, h.config, key_or_msg, w)
 		}
 	}
 
@@ -732,26 +735,32 @@ func isCGIEnvKey(key string) bool {
 // Request Reader
 type errorTrackingReader struct {
 	reader  io.Reader
+	bytes   int64
 	err     error
 	onError func()
 }
 
 func (r *errorTrackingReader) Read(buffer []byte) (int, error) {
-	count, err := r.reader.Read(buffer)
+	n, err := r.reader.Read(buffer)
+	r.bytes += int64(n)
 	if err != nil && !errors.Is(err, io.EOF) {
 		r.err = err
 		if r.onError != nil {
 			r.onError()
 		}
 	}
-	return count, err
+	return n, err
+}
+
+func (r *errorTrackingReader) Bytes() int64 {
+	return r.bytes
 }
 
 // Command Output Writer
 type outputWriter interface {
 	io.Writer
 	Err() error
-	BytesOut() int64
+	Bytes() int64
 }
 
 // for normal output
@@ -793,16 +802,15 @@ func (b *bufferWriter) Err() error {
 	return b.err
 }
 
-func (b *bufferWriter) BytesOut() int64 {
+func (b *bufferWriter) Bytes() int64 {
 	return b.bytes
 }
 
 // for stream output
 type streamWriter struct {
-	writer  *countingResponseWriter
-	bytes   int64
-	err     error
+	*countingResponseWriter
 	started bool
+	err     error
 	onError func()
 }
 
@@ -810,8 +818,7 @@ func (w *streamWriter) Write(data []byte) (int, error) {
 	if len(data) > 0 {
 		w.started = true
 	}
-	n, err := w.writer.Write(data)
-	w.bytes += int64(n)
+	n, err := w.countingResponseWriter.Write(data)
 	if err != nil {
 		if w.err == nil {
 			w.err = err
@@ -821,16 +828,13 @@ func (w *streamWriter) Write(data []byte) (int, error) {
 		}
 		return n, err
 	}
-	w.writer.Flush()
+	w.countingResponseWriter.Flush()
 	return n, nil
+
 }
 
 func (w *streamWriter) Err() error {
 	return w.err
-}
-
-func (w *streamWriter) BytesOut() int64 {
-	return w.bytes
 }
 
 func (w *streamWriter) Started() bool {
@@ -875,7 +879,7 @@ func (p *commandProcess) Start() error {
 	}
 	startedAt := time.Now()
 	log.Printf("[%v] command started, pid=%v, cmd=%v",
-		p.ctx.Value(ctxKeyID).(string), p.cmd.Process.Pid, p.cmd.Args)
+		p.ctx.Value(ctxKeyID).(string), p.cmd.Process.Pid, p.cmd.Path)
 
 	p.doneCh = make(chan struct{})
 	processDone := make(chan struct{})
@@ -937,16 +941,16 @@ func (p *commandProcess) Stop() {
 	p.cancel()
 }
 
-func execCommand(ctx context.Context, cfg *config, body io.Reader, w *countingResponseWriter) error {
+func execCommand(ctx context.Context, cfg *config, r io.Reader, w *countingResponseWriter) error {
 	proc := newCommandProcess(ctx, cfg, !cfg.stream)
 	defer proc.Stop()
 
-	errReader := &errorTrackingReader{reader: body, onError: proc.Stop}
+	errReader := &errorTrackingReader{reader: r, onError: proc.Stop}
 	proc.cmd.Stdin = errReader
 
 	var outWriter outputWriter
 	if cfg.stream {
-		outWriter = &streamWriter{writer: w, onError: proc.Stop}
+		outWriter = &streamWriter{countingResponseWriter: w, onError: proc.Stop}
 		w.Header().Set("Content-Type", "application/octet-stream")
 	} else {
 		outWriter = &bufferWriter{limit: cfg.maxOutputBytes, onLimit: proc.Stop}
@@ -969,9 +973,9 @@ func execCommand(ctx context.Context, cfg *config, body io.Reader, w *countingRe
 	} else if cmdErr != nil {
 		execErr = fmt.Errorf("command failed: %w", cmdErr)
 	} else {
-		log.Printf("[%v] command completed, pid=%v, exit=%v, duration=%v, bytes_out=%v",
+		log.Printf("[%v] command completed, pid=%v, exit=%v, duration=%v, byte_in=%v, bytes_out=%v",
 			ctx.Value(ctxKeyID).(string), proc.cmd.Process.Pid, proc.exitCode, proc.duration,
-			outWriter.BytesOut())
+			errReader.Bytes(), outWriter.Bytes())
 	}
 
 	if execErr != nil {
@@ -990,10 +994,11 @@ func execCommand(ctx context.Context, cfg *config, body io.Reader, w *countingRe
 	return writeResponse(proc.ctx, w, outWriter.(*bufferWriter))
 }
 
-func handleExecError(ctx context.Context, w *countingResponseWriter, err error) {
+func handleExecError(ctx context.Context, w http.ResponseWriter, err error) {
 	log.Printf("[%v] command failed, reason=%v", ctx.Value(ctxKeyID).(string), err)
 	if !errors.Is(err, context.Canceled) || ctx.Err() == nil {
 		status := http.StatusBadGateway
+		// XXX not supported Go 1.18
 		// var maxBytesError *http.MaxBytesError
 		// if errors.As(err, &maxBytesError) {
 		if strings.Contains(err.Error(), "http: request body too large") {
@@ -1006,7 +1011,7 @@ func handleExecError(ctx context.Context, w *countingResponseWriter, err error) 
 	}
 }
 
-func writeResponse(ctx context.Context, w *countingResponseWriter, b *bufferWriter) error {
+func writeResponse(ctx context.Context, w http.ResponseWriter, b *bufferWriter) error {
 	resp, err := parseCGIResponse(b.buffer.Bytes())
 	if err != nil {
 		log.Printf("[%v] parse GCI response failed: %v", ctx.Value(ctxKeyID).(string), err)
@@ -1164,39 +1169,35 @@ func sanitizeCGIHeaders(headers http.Header) {
 /////////////////////////////////////////////////////////////////////////////
 // WebSocket
 //
-func isWebSocketRequest(r *http.Request, w *countingResponseWriter) (bool, int, string) {
+func isWebSocketRequest(r *http.Request) (bool, int, string) {
 	if !headerContainsToken(r.Header.Values("Upgrade"), "websocket") {
 		return false, 0, ""
 	}
 
 	if r.Method != http.MethodGet {
-		return true, http.StatusMethodNotAllowed, "method not allowed"
+		return true, http.StatusMethodNotAllowed, "websocket: method not allowed"
 	}
 
 	if !headerContainsToken(r.Header.Values("Connection"), "Upgrade") {
-		return true, http.StatusBadRequest, "missing Connection: Upgrade"
+		return true, http.StatusBadRequest, "websocket: missing Connection: Upgrade"
 	}
 
 	if !webSocketOriginAllowed(r) {
-		return true, http.StatusForbidden, "mismatched Origin"
+		return true, http.StatusForbidden, "websocket: mismatched Origin"
 	}
 
 	if r.Header.Get("Sec-WebSocket-Version") != "13" {
-		w.Header().Set("Sec-WebSocket-Version", "13")
-		return true, http.StatusUpgradeRequired, "bad websocket version"
+		return true, http.StatusUpgradeRequired, "websocket: invalid version"
 	}
 
 	keys := r.Header.Values("Sec-WebSocket-Key")
 	if len(keys) != 1 {
-		return true, http.StatusBadRequest, "multiple websocket keys"
+		return true, http.StatusBadRequest, "websocket: empty/multiple keys"
 	}
 	key := strings.TrimSpace(keys[0])
-	if key == "" {
-		return true, http.StatusBadRequest, "empty websocket key"
-	}
 	decoded, err := base64.StdEncoding.DecodeString(key)
 	if err != nil || len(decoded) != 16 {
-		return true, http.StatusBadRequest, "bad websocket key"
+		return true, http.StatusBadRequest, "websocket: invalid key"
 	}
 
 	return true, http.StatusOK, key
@@ -1242,32 +1243,9 @@ func webSocketOriginAllowed(r *http.Request) bool {
 }
 
 // websocket writer / reader
-type countingWriter interface {
-	io.WriteCloser
-	BytesOut() int64
-}
-
-type wsRawWriter struct {
-	io.WriteCloser
-	bytes int64
-}
-
-func (w *wsRawWriter) Write(b []byte) (int, error) {
-	n, err := w.WriteCloser.Write(b)
-	w.bytes += int64(n)
-	return n, err
-}
-
-func (w *wsRawWriter) BytesOut() int64 {
-	return w.bytes
-}
-
-// TODO? countingReader
-
 type wsPayloadWriter struct {
-	to    io.Writer
-	bytes int64
-	mu    sync.Mutex
+	to io.Writer
+	mu sync.Mutex
 }
 
 func (w *wsPayloadWriter) Close() error {
@@ -1307,32 +1285,24 @@ func (w *wsPayloadWriter) WriteFrame(opcode byte, payload []byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if _, err := w.writeFull(hdr[:n]); err != nil {
+	if err := w.writeFull(hdr[:n]); err != nil {
 		return err
 	}
-	written, err := w.writeFull(payload)
-	w.bytes += written
-	return err
+	return w.writeFull(payload)
 }
 
-func (w *wsPayloadWriter) writeFull(b []byte) (int64, error) {
-	var total int64 = 0
+func (w *wsPayloadWriter) writeFull(b []byte) error {
 	for len(b) > 0 {
 		n, err := w.to.Write(b)
-		total += int64(n)
 		if err != nil {
-			return total, err
+			return err
 		}
 		if n == 0 {
-			return total, io.ErrShortWrite
+			return io.ErrShortWrite
 		}
 		b = b[n:]
 	}
-	return total, nil
-}
-
-func (w *wsPayloadWriter) BytesOut() int64 {
-	return w.bytes
+	return nil
 }
 
 type wsPayloadReader struct {
@@ -1342,7 +1312,6 @@ type wsPayloadReader struct {
 	mask       [4]byte
 	maskIdx    uint8
 	fragmented bool
-	bytes      int64
 }
 
 func (r *wsPayloadReader) Read(buffer []byte) (int, error) {
@@ -1462,7 +1431,6 @@ func (r *wsPayloadReader) unmaskPayload(p []byte) {
 		r.maskIdx &= 3
 		p[i] ^= r.mask[r.maskIdx]
 	}
-	r.bytes += int64(len(p))
 }
 
 // websocket serve entry
@@ -1494,11 +1462,11 @@ func serveWebSocket(ctx context.Context, cfg *config, key string, w *countingRes
 		toPeer := &wsPayloadWriter{to: conn}
 		return pipeCommand(ctx, cfg, &wsPayloadReader{from: rw.Reader, to: toPeer}, toPeer)
 	} else {
-		return pipeCommand(ctx, cfg, rw.Reader, &wsRawWriter{WriteCloser: conn})
+		return pipeCommand(ctx, cfg, rw.Reader, conn)
 	}
 }
 
-func pipeCommand(ctx context.Context, cfg *config, fromPeer io.Reader, toPeer countingWriter) error {
+func pipeCommand(ctx context.Context, cfg *config, fromPeer io.Reader, toPeer io.WriteCloser) error {
 	proc := newCommandProcess(ctx, cfg, false)
 	defer proc.Stop()
 
@@ -1521,16 +1489,16 @@ func pipeCommand(ctx context.Context, cfg *config, fromPeer io.Reader, toPeer co
 		return err
 	}
 
-	var bytes_in, bytes_out int64
+	var bytesIn, bytesOut int64
 	copyCh := make(chan error, 2)
 	go func() {
 		var err error
-		bytes_in, err = io.Copy(toCmd, fromPeer)
+		bytesIn, err = io.Copy(toCmd, fromPeer)
 		copyCh <- err
 	}()
 	go func() {
 		var err error
-		bytes_out, err = io.Copy(toPeer, fromCmd)
+		bytesOut, err = io.Copy(toPeer, fromCmd)
 		if err == nil && cfg.websocketMode >= 2 {
 			toPeer.(*wsPayloadWriter).WriteFrame(0x8, []byte{0x03, 0xe8})
 		}
@@ -1559,7 +1527,7 @@ func pipeCommand(ctx context.Context, cfg *config, fromPeer io.Reader, toPeer co
 	} else {
 		log.Printf("[%v] command completed, pid=%v, exit=%v, duration=%v, bytes_in=%v, bytes_out=%v",
 			proc.ctx.Value(ctxKeyID).(string), proc.cmd.Process.Pid, proc.exitCode, proc.duration,
-			bytes_in, bytes_out)
+			bytesIn, bytesOut)
 	}
 	return err
 }
@@ -1595,10 +1563,10 @@ func runServer(cfg *config) error {
 	srvCh := make(chan error, 1)
 	go func() {
 		if tlsConfig == nil {
-			log.Printf("listening on %s", cfg.addr)
+			log.Printf("listening on %s, cmdline: %v", cfg.addr, cfg.cmdline)
 			srvCh <- server.ListenAndServe()
 		} else {
-			log.Printf("listening on %s (TLS)", cfg.addr)
+			log.Printf("listening on %s (tls), cmdline: %v", cfg.addr, cfg.cmdline)
 			srvCh <- server.ListenAndServeTLS(cfg.cert, cfg.key)
 		}
 	}()
@@ -1634,10 +1602,10 @@ func main() {
 	cfg, err := parseArgs(os.Args[1:])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(2)
+		os.Exit(1)
 	}
 	if err := runServer(cfg); err != nil {
 		log.Printf("server failed: %v", err)
-		os.Exit(1)
+		os.Exit(2)
 	}
 }
