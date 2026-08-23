@@ -584,7 +584,7 @@ func (h *execHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		result = "rejected"
 		msg = fmt.Sprintf(", err=%v", err)
 	}
-	log.Printf("[%v] request %v, status=%v, duration=%v, bytes_transferred=%v%v",
+	log.Printf("[%v] request %v, status=%v, duration=%v, response_bytes=%v%v",
 		id, result, crw.status, time.Since(startedAt), crw.Bytes(), msg)
 }
 
@@ -909,7 +909,7 @@ func (p *commandProcess) Start() error {
 		} else if e, ok := p.waitErr.(*exec.ExitError); ok {
 			if w, ok := e.Sys().(syscall.WaitStatus); ok {
 				if s := w.Signal(); s > 0 {
-					p.exitCode = 127 + int(s)
+					p.exitCode = 128 + int(s)
 				} else {
 					p.exitCode = w.ExitStatus()
 				}
@@ -917,7 +917,7 @@ func (p *commandProcess) Start() error {
 				p.exitCode = e.ExitCode()
 			}
 		} else {
-			p.exitCode = 255
+			p.exitCode = 1
 		}
 		close(processDone)
 		<-watchDone
@@ -1397,7 +1397,7 @@ func (r *wsPayloadReader) handleOpcode(firstByte byte, length uint64) (bool, err
 			return false, errors.New("websocket: new data frame during fragmented message")
 		}
 	case 0x8, 0x9, 0xa:
-		if !fin || length == 1 || length > 125 {
+		if !fin || length > 125 || (opcode == 0x8 && length == 1) {
 			return false, errors.New("websocket: invalid control frame")
 		}
 		p := make([]byte, length)
@@ -1601,10 +1601,10 @@ func main() {
 	cfg, err := parseArgs(os.Args[1:])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		os.Exit(2)
 	}
 	if err := runServer(cfg); err != nil {
 		log.Printf("server failed: %v", err)
-		os.Exit(2)
+		os.Exit(1)
 	}
 }
