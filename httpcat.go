@@ -642,6 +642,7 @@ func buildCGIEnv(r *http.Request) []string {
 	env["QUERY_STRING"] = r.URL.RawQuery
 	env["SERVER_PROTOCOL"] = r.Proto
 	env["SCRIPT_NAME"] = ""
+	env["HTTP_HOST"] = r.Host
 
 	serverName, serverPort := splitHostPort(r.Host)
 	if localAddr, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok {
@@ -885,18 +886,13 @@ func (p *commandProcess) Start() error {
 	watchDone := make(chan struct{})
 	go func() {
 		defer close(watchDone)
-		var err error
 		select {
 		case <-p.sigCtx.Done():
-			err = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
 		case <-p.ctx.Done():
-			err = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
 		case <-processDone:
-			if p.ctx.Err() != nil {
-				err = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
-			}
 		}
-		if err != nil && !errors.Is(err, syscall.ESRCH) {
+		if err := syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL); err != nil &&
+			!errors.Is(err, syscall.ESRCH) {
 			log.Printf("[%v] kill process group failed: %v", p.ctx.Value(ctxKeyID).(string), err)
 		}
 	}()
@@ -958,6 +954,7 @@ func execCommand(ctx context.Context, cfg *config, r io.Reader, w *countingRespo
 
 	if err := proc.Start(); err != nil {
 		log.Printf("[%v] exec failed, reason=%v", ctx.Value(ctxKeyID).(string), err)
+		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
 		return err
 	}
 	cmdErr := proc.Wait()
@@ -970,7 +967,7 @@ func execCommand(ctx context.Context, cfg *config, r io.Reader, w *countingRespo
 	} else if proc.ctx.Err() != nil {
 		execErr = proc.ctx.Err()
 	} else if cmdErr != nil {
-		execErr = fmt.Errorf("command failed: %w", cmdErr)
+		execErr = cmdErr
 	} else {
 		log.Printf("[%v] command completed, pid=%v, exit=%v, duration=%v, byte_in=%v, bytes_out=%v",
 			ctx.Value(ctxKeyID).(string), proc.cmd.Process.Pid, proc.exitCode, proc.duration,
@@ -1013,7 +1010,7 @@ func handleExecError(ctx context.Context, w http.ResponseWriter, err error) {
 func writeResponse(ctx context.Context, w http.ResponseWriter, b *bufferWriter) error {
 	resp, err := parseCGIResponse(b.buffer.Bytes())
 	if err != nil {
-		log.Printf("[%v] parse GCI response failed: %v", ctx.Value(ctxKeyID).(string), err)
+		log.Printf("[%v] parse CGI response failed: %v", ctx.Value(ctxKeyID).(string), err)
 		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
 		return err
 	}
@@ -1436,6 +1433,7 @@ func (r *wsPayloadReader) unmaskPayload(p []byte) {
 func serveWebSocket(ctx context.Context, cfg *config, key string, w *countingResponseWriter) error {
 	conn, rw, err := w.Hijack()
 	if err != nil {
+		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
 		return err
 	}
 	defer conn.Close()
@@ -1513,12 +1511,16 @@ func pipeCommand(ctx context.Context, cfg *config, fromPeer io.Reader, toPeer io
 
 	<-copyCh
 	cmdErr := proc.Wait()
+	exited := true
+	if e, ok := cmdErr.(*exec.ExitError); ok {
+		exited = e.Exited()
+	}
 
-	if copyErr != nil && !errors.Is(copyErr, io.EOF) && !errors.Is(copyErr, os.ErrClosed) {
+	if copyErr != nil && !errors.Is(copyErr, os.ErrClosed) {
 		log.Printf("[%v] copy failed, reason=%v", ctx.Value(ctxKeyID).(string), copyErr)
 		err = copyErr
 	}
-	if cmdErr != nil && !errors.Is(proc.ctx.Err(), context.Canceled) {
+	if cmdErr != nil && (exited || !errors.Is(proc.ctx.Err(), context.Canceled)) {
 		log.Printf("[%v] command failed, reason=%v", ctx.Value(ctxKeyID).(string), cmdErr)
 		if err == nil {
 			err = cmdErr
