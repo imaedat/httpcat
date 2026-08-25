@@ -33,8 +33,10 @@ import (
 var version = "0.0.1"
 
 const (
-	readHeaderTimeout = 10 * time.Second
-	shutdownTimeout   = 5 * time.Second
+	readHeaderTimeout   = 10 * time.Second
+	shutdownTimeout     = 5 * time.Second
+	defaultOutputBuffer = 1 << 20
+	maxCGIHeaderBytes   = 64 << 10
 )
 
 type contextKey int
@@ -44,6 +46,12 @@ const (
 	ctxKeyID
 	ctxKeySignalCtx
 	ctxKeyEnviron
+)
+
+const (
+	_ int = iota
+	wsModeUpgrade
+	wsModeAware
 )
 
 /////////////////////////////////////////////////////////////////////////////
@@ -62,9 +70,9 @@ type config struct {
 	cmdline []string
 	stream  bool
 
-	maxBodyBytes   int64
-	maxOutputBytes int64
-	maxConnection  int
+	maxBodyBytes    int64
+	maxOutputBuffer int64
+	maxConnection   int
 
 	readTimeout    time.Duration
 	writeTimeout   time.Duration
@@ -76,7 +84,7 @@ func parseArgs(args []string) (*config, error) {
 		return nil, errors.New("usage: httpcat listen:addr[,cert=file,key=file,verify[=bool],cafile=file] exec:\"command [args...]\"")
 	}
 
-	cfg := &config{}
+	cfg := &config{maxOutputBuffer: defaultOutputBuffer}
 	seenListen := false
 	seenExec := false
 
@@ -207,12 +215,12 @@ func parseListen(cfg *config, spec string) error {
 			}
 			cfg.maxBodyBytes = limit
 
-		case "maxoutput":
+		case "outputbuffer":
 			limit, err := parsePositiveValueLimit(key, value, hasValue)
 			if err != nil {
 				return err
 			}
-			cfg.maxOutputBytes = limit
+			cfg.maxOutputBuffer = limit
 
 		case "maxconnection":
 			maxconn, err := parsePositiveValueLimit(key, value, hasValue)
@@ -227,9 +235,9 @@ func parseListen(cfg *config, spec string) error {
 			}
 			switch strings.ToLower(value) {
 			case "upgrade":
-				cfg.websocketMode = 1
+				cfg.websocketMode = wsModeUpgrade
 			case "aware":
-				cfg.websocketMode = 2
+				cfg.websocketMode = wsModeAware
 			default:
 				return fmt.Errorf("invalid websocket mode value: %q", value)
 			}
@@ -486,12 +494,6 @@ func buildTLSConfig(cfg *config) (*tls.Config, error) {
 /////////////////////////////////////////////////////////////////////////////
 // handler
 //
-type execHandler struct {
-	config  *config
-	rootCtx context.Context
-	sem     chan struct{}
-}
-
 func newID() string {
 	var b [16]byte
 	now := time.Now()
@@ -518,7 +520,37 @@ func newID() string {
 	return string(out[:])
 }
 
-// custom response writer
+// Request Reader
+type errorTrackingReader struct {
+	reader  io.Reader
+	bytes   int64
+	err     error
+	onError func()
+}
+
+func (r *errorTrackingReader) Read(buffer []byte) (int, error) {
+	n, err := r.reader.Read(buffer)
+	r.bytes += int64(n)
+	if err != nil && !errors.Is(err, io.EOF) {
+		r.err = err
+		if r.onError != nil {
+			r.onError()
+		}
+	}
+	return n, err
+}
+
+func (r *errorTrackingReader) Bytes() int64 {
+	return r.bytes
+}
+
+// Custom Response Writer
+type httpOutputWriter interface {
+	io.WriteCloser
+	Started() bool
+	Flush() error
+}
+
 type countingResponseWriter struct {
 	http.ResponseWriter
 	status int
@@ -551,8 +583,19 @@ func (w *countingResponseWriter) Flush() {
 	}
 }
 
+func (w *countingResponseWriter) Close() error {
+	if c, ok := w.ResponseWriter.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
+}
+
 func (w *countingResponseWriter) Bytes() int64 {
 	return w.bytes
+}
+
+func (w *countingResponseWriter) Started() bool {
+	return w.status != 0
 }
 
 func (w *countingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
@@ -564,6 +607,194 @@ func (w *countingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 
 func (w *countingResponseWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
+}
+
+type bufferingState int
+
+const (
+	bsFirstLineNotFound bufferingState = iota
+	bsMaybeCanonical
+	bsCanonicalBuffering
+	bsRawBuffering
+	bsStreaming
+)
+
+// for Normal (Buffered) Output
+type bufferedWriter struct {
+	*countingResponseWriter
+	ctx       context.Context
+	maxBuffer int64
+	buffer    bytes.Buffer
+	err       error
+	state     bufferingState
+	bodyStart int
+	headers   http.Header
+	noBody    bool
+}
+
+func (w *bufferedWriter) Write(p []byte) (int, error) {
+	if w.err != nil {
+		return 0, w.err
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+
+	if w.state == bsStreaming {
+		if w.noBody {
+			return 0, errors.New("response body is not allowed")
+		}
+		n, err := w.countingResponseWriter.Write(p)
+		if err != nil {
+			w.err = err
+			return n, err
+		}
+		w.countingResponseWriter.Flush()
+		return n, nil
+	}
+
+	w.buffer.Write(p)
+
+	return len(p), w.transitionState()
+}
+
+func (w *bufferedWriter) transitionState() error {
+	data := w.buffer.Bytes()
+	overThreshold := int64(len(data)) > w.maxBuffer
+
+	if w.state == bsFirstLineNotFound {
+		if firstLine, remainder := takeFirstLine(data); remainder != nil {
+			if strings.HasPrefix(firstLine, "HTTP/") || strings.Contains(firstLine, ":") {
+				w.state = bsMaybeCanonical
+			} else {
+				w.state = bsRawBuffering
+			}
+
+		} else if overThreshold {
+			// log.Printf("[%v] XXX bsFirstLineNotFound -> switch to bsStreaming", w.ctx.Value(ctxKeyID).(string))
+			return w.writeStreaming(http.StatusOK, w.buffer.Bytes())
+		} else if len(data) > maxCGIHeaderBytes {
+			return fmt.Errorf("CGI response header too large (limit=%d)", maxCGIHeaderBytes)
+		} else {
+			return nil
+		}
+	}
+
+	if w.state == bsMaybeCanonical {
+		if sepIdx, sepLen := findHeaderSeparator(data); sepIdx >= 0 {
+			status, headers, err := parseCGIResponseHeader(data[:sepIdx])
+			if err != nil {
+				return err
+			}
+			w.status = status
+			w.state = bsCanonicalBuffering
+			w.bodyStart = sepIdx + sepLen
+			w.headers = headers
+			w.noBody = !statusAllowsBody(status)
+
+		} else if overThreshold {
+			// log.Printf("[%v] XXX bsMaybeCanonical -> switch to bsStreaming", w.ctx.Value(ctxKeyID).(string))
+			return w.writeStreaming(http.StatusOK, w.buffer.Bytes())
+		} else if len(data) > maxCGIHeaderBytes {
+			return fmt.Errorf("CGI response header too large (limit=%d)", maxCGIHeaderBytes)
+		} else {
+			return nil
+		}
+	}
+
+	if w.state == bsCanonicalBuffering {
+		if overThreshold {
+			// log.Printf("[%v] XXX bsCanonicalBuffering -> switch to bsStreaming", w.ctx.Value(ctxKeyID).(string))
+			w.applyHeaders()
+			if !statusAllowsBody(w.status) && w.buffer.Len() > w.bodyStart {
+				return fmt.Errorf("status %d must not include a response body", w.status)
+			}
+			return w.writeStreaming(w.status, w.buffer.Bytes()[w.bodyStart:])
+		}
+	}
+
+	if w.state == bsRawBuffering {
+		if overThreshold {
+			// log.Printf("[%v] XXX bsRawBuffering -> switch to bsStreaming", w.ctx.Value(ctxKeyID).(string))
+			return w.writeStreaming(http.StatusOK, w.buffer.Bytes())
+		}
+	}
+
+	return nil
+}
+
+func (w *bufferedWriter) Flush() error {
+	if w.err != nil {
+		return w.err
+	}
+	if w.buffer.Len() == 0 || w.state == bsStreaming {
+		return nil
+	}
+
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	body := w.buffer.Bytes()
+	if w.state == bsCanonicalBuffering {
+		body = w.buffer.Bytes()[w.bodyStart:]
+	}
+	if !statusAllowsBody(w.status) && len(body) > 0 {
+		err := fmt.Errorf("status %d must not include a response body", w.status)
+		w.err = err
+		return err
+	}
+	w.applyHeaders()
+	if statusAllowsBody(w.status) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	}
+	return w.writeStreaming(w.status, body)
+
+}
+
+func (w *bufferedWriter) applyHeaders() {
+	for name, values := range w.headers {
+		for _, value := range values {
+			w.Header().Add(name, value)
+		}
+	}
+}
+
+func (w *bufferedWriter) writeStreaming(status int, b []byte) error {
+	w.state = bsStreaming
+	w.WriteHeader(status)
+	if len(b) > 0 {
+		if _, err := w.countingResponseWriter.Write(b); err != nil {
+			return err
+		}
+		w.countingResponseWriter.Flush()
+	}
+	w.buffer.Reset()
+	return nil
+}
+
+// for Stream Output
+type streamWriter struct {
+	*countingResponseWriter
+}
+
+func (w *streamWriter) Write(data []byte) (int, error) {
+	n, err := w.countingResponseWriter.Write(data)
+	if err == nil {
+		w.countingResponseWriter.Flush()
+	}
+	return n, err
+}
+
+func (w *streamWriter) Flush() error {
+	w.countingResponseWriter.Flush()
+	return nil
+}
+
+// handler
+type execHandler struct {
+	config  *config
+	rootCtx context.Context
+	sem     chan struct{}
 }
 
 func (h *execHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -602,34 +833,178 @@ func (h *execHandler) serve(ctx context.Context, r *http.Request, w *countingRes
 	ctx = context.WithValue(ctx, ctxKeySignalCtx, h.rootCtx)
 	ctx = context.WithValue(ctx, ctxKeyEnviron, buildCGIEnv(r))
 
-	if h.config.websocketMode >= 1 {
-		if status, key_or_msg := isWebSocketRequest(r); status > 0 {
-			if status == http.StatusOK {
-				return serveWebSocket(ctx, h.config, key_or_msg, w)
-			}
-			if status == http.StatusUpgradeRequired {
-				w.Header().Set("Sec-WebSocket-Version", "13")
-			}
-			http.Error(w, http.StatusText(status), status)
-			return errors.New(key_or_msg)
-		}
+	if handled, err := h.serveWebSocket(ctx, r, w); handled {
+		return err
 	}
 
-	var body io.ReadCloser
+	var bodyReader io.ReadCloser
 	if h.config.maxBodyBytes == 0 {
-		body = r.Body
+		bodyReader = r.Body
 	} else {
 		if r.ContentLength > h.config.maxBodyBytes {
-			http.Error(w, http.StatusText(http.StatusRequestEntityTooLarge),
-				http.StatusRequestEntityTooLarge)
+			http.Error(w, http.StatusText(http.StatusRequestEntityTooLarge), http.StatusRequestEntityTooLarge)
 			return fmt.Errorf("request entity too large (content_length=%v, limit=%v)",
 				r.ContentLength, h.config.maxBodyBytes)
 		}
-		body = http.MaxBytesReader(w, r.Body, h.config.maxBodyBytes)
+		bodyReader = http.MaxBytesReader(w, r.Body, h.config.maxBodyBytes)
 	}
-	defer body.Close()
+	defer bodyReader.Close()
 
-	return execCommand(ctx, h.config, body, w)
+	var respWriter httpOutputWriter
+	if h.config.stream {
+		respWriter = &streamWriter{countingResponseWriter: w}
+	} else {
+		respWriter = &bufferedWriter{countingResponseWriter: w, ctx: ctx, maxBuffer: h.config.maxOutputBuffer}
+	}
+	defer respWriter.Close()
+
+	if err := h.pipeCommand(ctx, bodyReader, respWriter, false); err != nil {
+		if respWriter.Started() {
+			log.Printf("[%v] exec failed after response started: %v", ctx.Value(ctxKeyID).(string), err)
+		} else {
+			handleExecError(ctx, w, err)
+		}
+		return err
+	}
+	if err := respWriter.Flush(); err != nil {
+		log.Printf("[%v] write response failed: %v", ctx.Value(ctxKeyID).(string), err)
+		if !respWriter.Started() {
+			handleExecError(ctx, w, err)
+		}
+		return err
+	}
+	return nil
+}
+
+func (h *execHandler) serveWebSocket(ctx context.Context, r *http.Request, w *countingResponseWriter) (bool, error) {
+	if h.config.websocketMode < wsModeUpgrade {
+		return false, nil
+	}
+	status, key_or_msg := isWebSocketRequest(r)
+	if status == 0 {
+		return false, nil
+	}
+	if status != http.StatusOK {
+		if status == http.StatusUpgradeRequired {
+			w.Header().Set("Sec-WebSocket-Version", "13")
+		}
+		http.Error(w, http.StatusText(status), status)
+		return true, errors.New(key_or_msg)
+	}
+
+	conn, rw, err := w.Hijack()
+	if err != nil {
+		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
+		return true, err
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Time{})
+
+	hash := sha1.New()
+	hash.Write([]byte(key_or_msg))
+	hash.Write([]byte("258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+	accept := base64.StdEncoding.EncodeToString(hash.Sum(nil))
+
+	if _, err = fmt.Fprintf(rw, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"+
+		"Connection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", accept); err == nil {
+		err = rw.Flush()
+	}
+	if err != nil {
+		log.Printf("[%v] Upgrade output failed: %v", ctx.Value(ctxKeyID).(string), err)
+		return true, err
+	}
+	log.Printf("[%v] websocket upgraded", ctx.Value(ctxKeyID).(string))
+	w.status = http.StatusSwitchingProtocols
+
+	if h.config.websocketMode >= wsModeAware {
+		toPeer := &wsPayloadWriter{to: conn}
+		return true, h.pipeCommand(ctx, &wsPayloadReader{from: rw.Reader, to: toPeer}, toPeer, true)
+	} else {
+		return true, h.pipeCommand(ctx, rw.Reader, conn, true)
+	}
+}
+
+type copyError struct {
+	error
+	outputDone bool
+}
+
+func (h *execHandler) pipeCommand(
+	ctx context.Context, fromPeer io.Reader, toPeer io.WriteCloser, inWebSock bool) error {
+
+	proc := newCommandProcess(ctx, h.config, !h.config.stream && !inWebSock)
+	defer proc.Stop()
+
+	toCmd, err := proc.cmd.StdinPipe()
+	if err != nil {
+		log.Printf("[%v] command stdin pipe failed: %v", ctx.Value(ctxKeyID).(string), err)
+		return err
+	}
+	defer toCmd.Close()
+
+	fromCmd, err := proc.cmd.StdoutPipe()
+	if err != nil {
+		log.Printf("[%v] command stdout pipe failed: %v", ctx.Value(ctxKeyID).(string), err)
+		return err
+	}
+	defer fromCmd.Close()
+
+	if err := proc.Start(); err != nil {
+		log.Printf("[%v] exec failed, reason=%v", ctx.Value(ctxKeyID).(string), err)
+		return err
+	}
+
+	var bytesIn, bytesOut int64
+	copyCh := make(chan copyError, 2)
+	go func() { // input
+		var err error
+		bytesIn, err = io.Copy(toCmd, fromPeer)
+		_ = toCmd.Close()
+		copyCh <- copyError{error: err, outputDone: false}
+	}()
+	go func() { // output
+		var err error
+		bytesOut, err = io.Copy(toPeer, fromCmd)
+		if err == nil && inWebSock && h.config.websocketMode >= wsModeAware {
+			if w, ok := toPeer.(*wsPayloadWriter); ok {
+				w.WriteFrame(0x8, []byte{0x03, 0xe8})
+			}
+		}
+		copyCh <- copyError{error: err, outputDone: true}
+	}()
+
+	copyErr := <-copyCh
+	if copyErr.outputDone || copyErr.error != nil || inWebSock {
+		proc.Stop()
+		if inWebSock {
+			_ = toCmd.Close()
+			_ = fromCmd.Close()
+			_ = toPeer.Close()
+		}
+	}
+
+	<-copyCh
+	cmdErr := proc.Wait()
+	exited := true
+	if e, ok := cmdErr.(*exec.ExitError); ok {
+		exited = e.Exited()
+	}
+
+	if copyErr.error != nil && !errors.Is(copyErr.error, os.ErrClosed) {
+		log.Printf("[%v] copy failed, reason=%v", ctx.Value(ctxKeyID).(string), copyErr.error)
+		err = copyErr.error
+	}
+	if cmdErr != nil && (exited || !errors.Is(proc.ctx.Err(), context.Canceled)) {
+		// log.Printf("[%v] command failed, reason=%v", ctx.Value(ctxKeyID).(string), cmdErr)
+		if err == nil {
+			err = cmdErr
+		}
+	} else {
+		log.Printf("[%v] command completed, pid=%v, exit=%v, duration=%v, bytes_in=%v, bytes_out=%v",
+			proc.ctx.Value(ctxKeyID).(string), proc.cmd.Process.Pid, proc.exitCode, proc.duration,
+			bytesIn, bytesOut)
+	}
+	return err
 }
 
 func buildCGIEnv(r *http.Request) []string {
@@ -732,113 +1107,21 @@ func isCGIEnvKey(key string) bool {
 	}
 }
 
-// Request Reader
-type errorTrackingReader struct {
-	reader  io.Reader
-	bytes   int64
-	err     error
-	onError func()
-}
-
-func (r *errorTrackingReader) Read(buffer []byte) (int, error) {
-	n, err := r.reader.Read(buffer)
-	r.bytes += int64(n)
-	if err != nil && !errors.Is(err, io.EOF) {
-		r.err = err
-		if r.onError != nil {
-			r.onError()
+func handleExecError(ctx context.Context, w http.ResponseWriter, err error) {
+	log.Printf("[%v] command failed, reason=%v", ctx.Value(ctxKeyID).(string), err)
+	if !errors.Is(err, context.Canceled) || ctx.Err() == nil {
+		status := http.StatusBadGateway
+		// XXX not supported Go 1.18
+		// var maxBytesError *http.MaxBytesError
+		// if errors.As(err, &maxBytesError) {
+		if strings.Contains(err.Error(), "http: request body too large") {
+			status = http.StatusRequestEntityTooLarge
+		} else if errors.Is(err, context.DeadlineExceeded) ||
+			errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			status = http.StatusGatewayTimeout
 		}
+		http.Error(w, http.StatusText(status), status)
 	}
-	return n, err
-}
-
-func (r *errorTrackingReader) Bytes() int64 {
-	return r.bytes
-}
-
-// Command Output Writer
-type outputWriter interface {
-	io.Writer
-	Err() error
-	Bytes() int64
-}
-
-// for normal output
-type bufferWriter struct {
-	buffer  bytes.Buffer
-	limit   int64
-	bytes   int64
-	err     error
-	onLimit func()
-}
-
-func (b *bufferWriter) Write(data []byte) (int, error) {
-	if b.limit == 0 {
-		n, err := b.buffer.Write(data)
-		b.bytes += int64(n)
-		return n, err
-	}
-
-	remaining := b.limit - int64(b.buffer.Len())
-	if int64(len(data)) <= remaining {
-		n, err := b.buffer.Write(data)
-		b.bytes += int64(n)
-		return n, err
-	}
-
-	written := 0
-	if remaining > 0 {
-		written, _ = b.buffer.Write(data[:int(remaining)])
-	}
-	b.err = fmt.Errorf("exec output too large (limit=%v)", b.limit)
-	if b.onLimit != nil {
-		b.onLimit()
-	}
-	b.bytes += int64(written)
-	return written, b.err
-}
-
-func (b *bufferWriter) Err() error {
-	return b.err
-}
-
-func (b *bufferWriter) Bytes() int64 {
-	return b.bytes
-}
-
-// for stream output
-type streamWriter struct {
-	*countingResponseWriter
-	started bool
-	err     error
-	onError func()
-}
-
-func (w *streamWriter) Write(data []byte) (int, error) {
-	if len(data) > 0 {
-		w.started = true
-	}
-	n, err := w.countingResponseWriter.Write(data)
-	if err != nil {
-		if w.err == nil {
-			w.err = err
-			if w.onError != nil {
-				w.onError()
-			}
-		}
-		return n, err
-	}
-	w.countingResponseWriter.Flush()
-	return n, nil
-
-}
-
-func (w *streamWriter) Err() error {
-	return w.err
-}
-
-func (w *streamWriter) Started() bool {
-	return w.started
 }
 
 // Command Process
@@ -936,128 +1219,26 @@ func (p *commandProcess) Stop() {
 	p.cancel()
 }
 
-func execCommand(ctx context.Context, cfg *config, r io.Reader, w *countingResponseWriter) error {
-	proc := newCommandProcess(ctx, cfg, !cfg.stream)
-	defer proc.Stop()
-
-	errReader := &errorTrackingReader{reader: r, onError: proc.Stop}
-	proc.cmd.Stdin = errReader
-
-	var outWriter outputWriter
-	if cfg.stream {
-		outWriter = &streamWriter{countingResponseWriter: w, onError: proc.Stop}
-		w.Header().Set("Content-Type", "application/octet-stream")
-	} else {
-		outWriter = &bufferWriter{limit: cfg.maxOutputBytes, onLimit: proc.Stop}
-	}
-	proc.cmd.Stdout = outWriter
-
-	if err := proc.Start(); err != nil {
-		log.Printf("[%v] exec failed, reason=%v", ctx.Value(ctxKeyID).(string), err)
-		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
-		return err
-	}
-	cmdErr := proc.Wait()
-
-	var execErr error
-	if outWriter.Err() != nil {
-		execErr = outWriter.Err()
-	} else if errReader.err != nil {
-		execErr = fmt.Errorf("read request body: %w", errReader.err)
-	} else if proc.ctx.Err() != nil {
-		execErr = proc.ctx.Err()
-	} else if cmdErr != nil {
-		execErr = cmdErr
-	} else {
-		log.Printf("[%v] command completed, pid=%v, exit=%v, duration=%v, byte_in=%v, bytes_out=%v",
-			ctx.Value(ctxKeyID).(string), proc.cmd.Process.Pid, proc.exitCode, proc.duration,
-			errReader.Bytes(), outWriter.Bytes())
-	}
-
-	if execErr != nil {
-		if s, ok := outWriter.(*streamWriter); ok && s.Started() {
-			log.Printf("[%v] exec failed after streaming response started: %v",
-				ctx.Value(ctxKeyID).(string), execErr)
-		} else {
-			handleExecError(proc.ctx, w, execErr)
-		}
-		return execErr
-	}
-
-	if cfg.stream {
-		return nil
-	}
-	return writeResponse(proc.ctx, w, outWriter.(*bufferWriter))
-}
-
-func handleExecError(ctx context.Context, w http.ResponseWriter, err error) {
-	log.Printf("[%v] command failed, reason=%v", ctx.Value(ctxKeyID).(string), err)
-	if !errors.Is(err, context.Canceled) || ctx.Err() == nil {
-		status := http.StatusBadGateway
-		// XXX not supported Go 1.18
-		// var maxBytesError *http.MaxBytesError
-		// if errors.As(err, &maxBytesError) {
-		if strings.Contains(err.Error(), "http: request body too large") {
-			status = http.StatusRequestEntityTooLarge
-		} else if errors.Is(err, context.DeadlineExceeded) ||
-			errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			status = http.StatusGatewayTimeout
-		}
-		http.Error(w, http.StatusText(status), status)
-	}
-}
-
-func writeResponse(ctx context.Context, w http.ResponseWriter, b *bufferWriter) error {
-	resp, err := parseCGIResponse(b.buffer.Bytes())
-	if err != nil {
-		log.Printf("[%v] parse CGI response failed: %v", ctx.Value(ctxKeyID).(string), err)
-		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
-		return err
-	}
-
-	for n, vs := range resp.headers {
-		for _, v := range vs {
-			w.Header().Add(n, v)
-		}
-	}
-	if statusAllowsBody(resp.status) {
-		w.Header().Set("Content-Length", strconv.Itoa(len(resp.body)))
-	}
-
-	w.WriteHeader(resp.status)
-	if len(resp.body) > 0 {
-		_, err := w.Write(resp.body)
-		if err != nil {
-			log.Printf("[%v] write response failed: %v", ctx.Value(ctxKeyID).(string), err)
-		}
-	}
-	return nil
-}
-
+// response parsing
 type execResponse struct {
 	status  int
 	headers http.Header
 	body    []byte
 }
 
-func parseCGIResponse(data []byte) (*execResponse, error) {
-	headerPart, body, hasHeaders := splitExecOutput(data)
-	if !hasHeaders {
-		return &execResponse{status: http.StatusOK, headers: make(http.Header), body: data}, nil
-	}
-
+func parseCGIResponseHeader(headerPart []byte) (int, http.Header, error) {
 	hasStatusLine, status := false, http.StatusOK
 	if firstLine, remainder := takeFirstLine(headerPart); strings.HasPrefix(firstLine, "HTTP/") {
 		parts := strings.SplitN(firstLine, " ", 3)
 		if len(parts) < 2 {
-			return nil, fmt.Errorf("invalid HTTP status line %q", firstLine)
+			return 0, nil, fmt.Errorf("invalid HTTP status line %q", firstLine)
 		}
 		if _, _, ok := http.ParseHTTPVersion(parts[0]); !ok {
-			return nil, fmt.Errorf("invalid HTTP version in status line %q", firstLine)
+			return 0, nil, fmt.Errorf("invalid HTTP version in status line %q", firstLine)
 		}
 		parsedStatus, err := parseStatusCode(parts[1])
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
 		headerPart = remainder
 		hasStatusLine, status = true, parsedStatus
@@ -1069,57 +1250,90 @@ func parseCGIResponse(data []byte) (*execResponse, error) {
 	mimeHeaders, err :=
 		textproto.NewReader(bufio.NewReader(bytes.NewReader(headerInput))).ReadMIMEHeader()
 	if err != nil {
-		return nil, fmt.Errorf("invalid HTTP headers: %w", err)
+		return 0, nil, fmt.Errorf("invalid HTTP headers: %w", err)
 	}
 	headers := http.Header(mimeHeaders)
 
 	statusValues := headers.Values("Status")
 	if hasStatusLine && len(statusValues) > 0 {
-		return nil, errors.New("response contains both an HTTP status line and a Status header")
+		return 0, nil, errors.New("response contains both an HTTP status line and a Status header")
 	}
 	if len(statusValues) > 1 {
-		return nil, errors.New("response contains multiple Status headers")
+		return 0, nil, errors.New("response contains multiple Status headers")
 	}
 	if len(statusValues) == 1 {
 		fields := strings.Fields(statusValues[0])
 		if len(fields) == 0 {
-			return nil, errors.New("empty CGI Status header")
+			return 0, nil, errors.New("empty CGI Status header")
 		}
-		status, err = parseStatusCode(fields[0])
+		parsedStatus, err := parseStatusCode(fields[0])
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
+		status = parsedStatus
 	}
 	headers.Del("Status")
 
 	if !hasStatusLine && len(statusValues) == 0 && headers.Get("Location") != "" {
 		status = http.StatusFound
 	}
+
+	for _, vs := range headers.Values("Connection") {
+		for _, token := range strings.Split(vs, ",") {
+			if name := textproto.TrimString(token); name != "" {
+				headers.Del(name)
+			}
+		}
+	}
+	for _, name := range []string{"Connection", "Content-Length", "Keep-Alive",
+		"Proxy-Authenticate", "Proxy-Authorization", "Proxy-Connection", "TE",
+		"Trailer", "Transfer-Encoding", "Upgrade"} {
+		headers.Del(name)
+	}
+
+	return status, headers, nil
+}
+
+func parseCGIResponse(data []byte) (*execResponse, error) {
+	hasHeaders, headerPart, body := splitExecOutput(data)
+	if !hasHeaders {
+		return &execResponse{status: http.StatusOK, headers: make(http.Header), body: data}, nil
+	}
+
+	status, headers, err := parseCGIResponseHeader(headerPart)
+	if err != nil {
+		return nil, err
+	}
+
 	if !statusAllowsBody(status) && len(body) > 0 {
 		return nil, fmt.Errorf("status %d must not include a response body", status)
 	}
-	sanitizeCGIHeaders(headers)
 
 	return &execResponse{status: status, headers: headers, body: body}, nil
 }
 
-func splitExecOutput(data []byte) ([]byte, []byte, bool) {
+func findHeaderSeparator(data []byte) (int, int) {
 	sepIdx, sepLen := -1, 0
 	for _, sep := range [][]byte{[]byte("\r\n\r\n"), []byte("\n\n")} {
 		if i := bytes.Index(data, sep); i >= 0 && (sepIdx < 0 || i < sepIdx) {
 			sepIdx, sepLen = i, len(sep)
 		}
 	}
+	return sepIdx, sepLen
+}
+
+func splitExecOutput(data []byte) (bool, []byte, []byte) {
+	sepIdx, sepLen := findHeaderSeparator(data)
 	if sepIdx < 0 {
-		return nil, data, false
+		return false, nil, data
 	}
 
 	headerPart := data[:sepIdx]
 	firstLine, _ := takeFirstLine(headerPart)
 	if !strings.HasPrefix(firstLine, "HTTP/") && !strings.Contains(firstLine, ":") {
-		return nil, data, false
+		return false, nil, data
 	}
-	return headerPart, data[sepIdx+sepLen:], true
+	return true, headerPart, data[sepIdx+sepLen:]
 }
 
 func takeFirstLine(data []byte) (string, []byte) {
@@ -1145,21 +1359,6 @@ func parseStatusCode(value string) (int, error) {
 func statusAllowsBody(status int) bool {
 	return status != http.StatusNoContent && status != http.StatusResetContent &&
 		status != http.StatusNotModified
-}
-
-func sanitizeCGIHeaders(headers http.Header) {
-	for _, vs := range headers.Values("Connection") {
-		for _, token := range strings.Split(vs, ",") {
-			if name := textproto.TrimString(token); name != "" {
-				headers.Del(name)
-			}
-		}
-	}
-	for _, name := range []string{"Connection", "Content-Length", "Keep-Alive",
-		"Proxy-Authenticate", "Proxy-Authorization", "Proxy-Connection", "TE",
-		"Trailer", "Transfer-Encoding", "Upgrade"} {
-		headers.Del(name)
-	}
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -1427,110 +1626,6 @@ func (r *wsPayloadReader) unmaskPayload(p []byte) {
 		r.maskIdx &= 3
 		p[i] ^= r.mask[r.maskIdx]
 	}
-}
-
-// websocket serve entry
-func serveWebSocket(ctx context.Context, cfg *config, key string, w *countingResponseWriter) error {
-	conn, rw, err := w.Hijack()
-	if err != nil {
-		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
-		return err
-	}
-	defer conn.Close()
-	conn.SetDeadline(time.Time{})
-
-	h := sha1.New()
-	h.Write([]byte(key))
-	h.Write([]byte("258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
-	accept := base64.StdEncoding.EncodeToString(h.Sum(nil))
-
-	if _, err = fmt.Fprintf(rw, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"+
-		"Connection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", accept); err == nil {
-		err = rw.Flush()
-	}
-	if err != nil {
-		log.Printf("[%v] Upgrade output failed: %v", ctx.Value(ctxKeyID).(string), err)
-		return err
-	}
-	log.Printf("[%v] websocket upgraded", ctx.Value(ctxKeyID).(string))
-	w.status = http.StatusSwitchingProtocols
-
-	if cfg.websocketMode >= 2 {
-		toPeer := &wsPayloadWriter{to: conn}
-		return pipeCommand(ctx, cfg, &wsPayloadReader{from: rw.Reader, to: toPeer}, toPeer)
-	} else {
-		return pipeCommand(ctx, cfg, rw.Reader, conn)
-	}
-}
-
-func pipeCommand(ctx context.Context, cfg *config, fromPeer io.Reader, toPeer io.WriteCloser) error {
-	proc := newCommandProcess(ctx, cfg, false)
-	defer proc.Stop()
-
-	toCmd, err := proc.cmd.StdinPipe()
-	if err != nil {
-		log.Printf("[%v] command stdin pipe failed: %v", ctx.Value(ctxKeyID).(string), err)
-		return err
-	}
-	defer toCmd.Close()
-
-	fromCmd, err := proc.cmd.StdoutPipe()
-	if err != nil {
-		log.Printf("[%v] command stdout pipe failed: %v", ctx.Value(ctxKeyID).(string), err)
-		return err
-	}
-	defer fromCmd.Close()
-
-	if err := proc.Start(); err != nil {
-		log.Printf("[%v] exec failed, reason=%v", ctx.Value(ctxKeyID).(string), err)
-		return err
-	}
-
-	var bytesIn, bytesOut int64
-	copyCh := make(chan error, 2)
-	go func() {
-		var err error
-		bytesIn, err = io.Copy(toCmd, fromPeer)
-		copyCh <- err
-	}()
-	go func() {
-		var err error
-		bytesOut, err = io.Copy(toPeer, fromCmd)
-		if err == nil && cfg.websocketMode >= 2 {
-			toPeer.(*wsPayloadWriter).WriteFrame(0x8, []byte{0x03, 0xe8})
-		}
-		copyCh <- err
-	}()
-
-	copyErr := <-copyCh
-	proc.Stop()
-
-	_ = toPeer.Close()
-	_ = toCmd.Close()
-	_ = fromCmd.Close()
-
-	<-copyCh
-	cmdErr := proc.Wait()
-	exited := true
-	if e, ok := cmdErr.(*exec.ExitError); ok {
-		exited = e.Exited()
-	}
-
-	if copyErr != nil && !errors.Is(copyErr, os.ErrClosed) {
-		log.Printf("[%v] copy failed, reason=%v", ctx.Value(ctxKeyID).(string), copyErr)
-		err = copyErr
-	}
-	if cmdErr != nil && (exited || !errors.Is(proc.ctx.Err(), context.Canceled)) {
-		log.Printf("[%v] command failed, reason=%v", ctx.Value(ctxKeyID).(string), cmdErr)
-		if err == nil {
-			err = cmdErr
-		}
-	} else {
-		log.Printf("[%v] command completed, pid=%v, exit=%v, duration=%v, bytes_in=%v, bytes_out=%v",
-			proc.ctx.Value(ctxKeyID).(string), proc.cmd.Process.Pid, proc.exitCode, proc.duration,
-			bytesIn, bytesOut)
-	}
-	return err
 }
 
 /////////////////////////////////////////////////////////////////////////////
