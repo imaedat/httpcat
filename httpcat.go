@@ -598,6 +598,13 @@ func (w *countingResponseWriter) Started() bool {
 	return w.status != 0
 }
 
+func (w *countingResponseWriter) Status() int {
+	//if w.status == 0 {
+	//	return http.StatusOK
+	//}
+	return w.status
+}
+
 func (w *countingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
 		return h.Hijack()
@@ -692,9 +699,9 @@ func (w *bufferedWriter) transitionState() error {
 			w.headers = headers
 			w.noBody = !statusAllowsBody(status)
 
-		} else if overThreshold {
-			// log.Printf("[%v] XXX bsMaybeCanonical -> switch to bsStreaming", w.ctx.Value(ctxKeyID).(string))
-			return w.writeStreaming(http.StatusOK, w.buffer.Bytes())
+		//} else if overThreshold {
+		//	// log.Printf("[%v] XXX bsMaybeCanonical -> switch to bsStreaming", w.ctx.Value(ctxKeyID).(string))
+		//	return w.writeStreaming(http.StatusOK, w.buffer.Bytes())
 		} else if len(data) > maxCGIHeaderBytes {
 			return fmt.Errorf("CGI response header too large (limit=%d)", maxCGIHeaderBytes)
 		} else {
@@ -730,6 +737,10 @@ func (w *bufferedWriter) Flush() error {
 	if w.buffer.Len() == 0 || w.state == bsStreaming {
 		return nil
 	}
+	if w.state == bsMaybeCanonical {
+		w.err = errors.New("incomplete CGI response header")
+		return w.err
+	}
 
 	if w.status == 0 {
 		w.status = http.StatusOK
@@ -739,9 +750,8 @@ func (w *bufferedWriter) Flush() error {
 		body = w.buffer.Bytes()[w.bodyStart:]
 	}
 	if !statusAllowsBody(w.status) && len(body) > 0 {
-		err := fmt.Errorf("status %d must not include a response body", w.status)
-		w.err = err
-		return err
+		w.err = fmt.Errorf("status %d must not include a response body", w.status)
+		return w.err
 	}
 	w.applyHeaders()
 	if statusAllowsBody(w.status) {
@@ -811,12 +821,12 @@ func (h *execHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	err := h.serve(ctx, r, crw)
 	result := "completed"
 	var msg string
-	if 400 <= crw.status && crw.status < 500 {
+	if 400 <= crw.Status() && crw.Status() < 500 {
 		result = "rejected"
 		msg = fmt.Sprintf(", err=%v", err)
 	}
 	log.Printf("[%v] request %v, status=%v, duration=%v, response_bytes=%v%v",
-		id, result, crw.status, time.Since(startedAt), crw.Bytes(), msg)
+		id, result, crw.Status(), time.Since(startedAt), crw.Bytes(), msg)
 }
 
 func (h *execHandler) serve(ctx context.Context, r *http.Request, w *countingResponseWriter) error {
@@ -852,6 +862,7 @@ func (h *execHandler) serve(ctx context.Context, r *http.Request, w *countingRes
 
 	var respWriter httpOutputWriter
 	if h.config.stream {
+		w.Header().Set("Content-Type", "application/octet-stream")
 		respWriter = &streamWriter{countingResponseWriter: w}
 	} else {
 		respWriter = &bufferedWriter{countingResponseWriter: w, ctx: ctx, maxBuffer: h.config.maxOutputBuffer}
@@ -920,7 +931,7 @@ func (h *execHandler) serveWebSocket(ctx context.Context, r *http.Request, w *co
 		toPeer := &wsPayloadWriter{to: conn}
 		return true, h.pipeCommand(ctx, &wsPayloadReader{from: rw.Reader, to: toPeer}, toPeer, true)
 	} else {
-		return true, h.pipeCommand(ctx, rw.Reader, conn, true)
+		return true, h.pipeCommand(ctx, &wsFrameReader{Reader: rw.Reader, conn: conn}, conn, true)
 	}
 }
 
@@ -930,7 +941,7 @@ type copyError struct {
 }
 
 func (h *execHandler) pipeCommand(
-	ctx context.Context, fromPeer io.Reader, toPeer io.WriteCloser, inWebSock bool) error {
+	ctx context.Context, fromPeer io.ReadCloser, toPeer io.WriteCloser, inWebSock bool) error {
 
 	proc := newCommandProcess(ctx, h.config, !h.config.stream && !inWebSock)
 	defer proc.Stop()
@@ -975,6 +986,7 @@ func (h *execHandler) pipeCommand(
 
 	copyErr := <-copyCh
 	if copyErr.outputDone || copyErr.error != nil || inWebSock {
+		_ = fromPeer.Close()
 		proc.Stop()
 		if inWebSock {
 			_ = toCmd.Close()
@@ -1438,6 +1450,15 @@ func webSocketOriginAllowed(r *http.Request) bool {
 }
 
 // websocket writer / reader
+type wsFrameReader struct {
+	io.Reader
+	conn net.Conn
+}
+
+func (r *wsFrameReader) Close() error {
+	return r.conn.Close()
+}
+
 type wsPayloadWriter struct {
 	to io.Writer
 	mu sync.Mutex
@@ -1626,6 +1647,10 @@ func (r *wsPayloadReader) unmaskPayload(p []byte) {
 		r.maskIdx &= 3
 		p[i] ^= r.mask[r.maskIdx]
 	}
+}
+
+func (r *wsPayloadReader) Close() error {
+	return r.to.Close()
 }
 
 /////////////////////////////////////////////////////////////////////////////
