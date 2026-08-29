@@ -546,7 +546,7 @@ func (r *errorTrackingReader) Bytes() int64 {
 
 // Custom Response Writer
 type httpOutputWriter interface {
-	io.WriteCloser
+	io.Writer
 	Started() bool
 	Flush() error
 }
@@ -581,13 +581,6 @@ func (w *countingResponseWriter) Flush() {
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
-}
-
-func (w *countingResponseWriter) Close() error {
-	if c, ok := w.ResponseWriter.(io.Closer); ok {
-		return c.Close()
-	}
-	return nil
 }
 
 func (w *countingResponseWriter) Bytes() int64 {
@@ -699,9 +692,6 @@ func (w *bufferedWriter) transitionState() error {
 			w.headers = headers
 			w.noBody = !statusAllowsBody(status)
 
-		//} else if overThreshold {
-		//	// log.Printf("[%v] XXX bsMaybeCanonical -> switch to bsStreaming", w.ctx.Value(ctxKeyID).(string))
-		//	return w.writeStreaming(http.StatusOK, w.buffer.Bytes())
 		} else if len(data) > maxCGIHeaderBytes {
 			return fmt.Errorf("CGI response header too large (limit=%d)", maxCGIHeaderBytes)
 		} else {
@@ -867,7 +857,6 @@ func (h *execHandler) serve(ctx context.Context, r *http.Request, w *countingRes
 	} else {
 		respWriter = &bufferedWriter{countingResponseWriter: w, ctx: ctx, maxBuffer: h.config.maxOutputBuffer}
 	}
-	defer respWriter.Close()
 
 	if err := h.pipeCommand(ctx, bodyReader, respWriter, false); err != nil {
 		if respWriter.Started() {
@@ -941,7 +930,7 @@ type copyError struct {
 }
 
 func (h *execHandler) pipeCommand(
-	ctx context.Context, fromPeer io.ReadCloser, toPeer io.WriteCloser, inWebSock bool) error {
+	ctx context.Context, fromPeer io.ReadCloser, toPeer io.Writer, inWebSock bool) error {
 
 	proc := newCommandProcess(ctx, h.config, !h.config.stream && !inWebSock)
 	defer proc.Stop()
@@ -970,8 +959,8 @@ func (h *execHandler) pipeCommand(
 	go func() { // input
 		var err error
 		bytesIn, err = io.Copy(toCmd, fromPeer)
-		_ = toCmd.Close()
 		copyCh <- copyError{error: err, outputDone: false}
+		_ = toCmd.Close()
 	}()
 	go func() { // output
 		var err error
@@ -982,16 +971,15 @@ func (h *execHandler) pipeCommand(
 			}
 		}
 		copyCh <- copyError{error: err, outputDone: true}
+		_ = fromPeer.Close()
 	}()
 
 	copyErr := <-copyCh
 	if copyErr.outputDone || copyErr.error != nil || inWebSock {
-		_ = fromPeer.Close()
 		proc.Stop()
 		if inWebSock {
 			_ = toCmd.Close()
 			_ = fromCmd.Close()
-			_ = toPeer.Close()
 		}
 	}
 
