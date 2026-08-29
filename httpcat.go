@@ -592,9 +592,9 @@ func (w *countingResponseWriter) Started() bool {
 }
 
 func (w *countingResponseWriter) Status() int {
-	//if w.status == 0 {
-	//	return http.StatusOK
-	//}
+	if w.status == 0 {
+		return http.StatusOK
+	}
 	return w.status
 }
 
@@ -629,7 +629,6 @@ type bufferedWriter struct {
 	state     bufferingState
 	bodyStart int
 	headers   http.Header
-	noBody    bool
 }
 
 func (w *bufferedWriter) Write(p []byte) (int, error) {
@@ -641,7 +640,7 @@ func (w *bufferedWriter) Write(p []byte) (int, error) {
 	}
 
 	if w.state == bsStreaming {
-		if w.noBody {
+		if !statusAllowsBody(w.Status()) {
 			return 0, errors.New("response body is not allowed")
 		}
 		n, err := w.countingResponseWriter.Write(p)
@@ -660,7 +659,7 @@ func (w *bufferedWriter) Write(p []byte) (int, error) {
 
 func (w *bufferedWriter) transitionState() error {
 	data := w.buffer.Bytes()
-	overThreshold := int64(len(data)) > w.maxBuffer
+	bufferOver := int64(len(data)) > w.maxBuffer
 
 	if w.state == bsFirstLineNotFound {
 		if firstLine, remainder := takeFirstLine(data); remainder != nil {
@@ -670,9 +669,8 @@ func (w *bufferedWriter) transitionState() error {
 				w.state = bsRawBuffering
 			}
 
-		} else if overThreshold {
-			// log.Printf("[%v] XXX bsFirstLineNotFound -> switch to bsStreaming", w.ctx.Value(ctxKeyID).(string))
-			return w.writeStreaming(http.StatusOK, w.buffer.Bytes())
+		} else if bufferOver {
+			return w.writeStreaming(w.buffer.Bytes())
 		} else if len(data) > maxCGIHeaderBytes {
 			return fmt.Errorf("CGI response header too large (limit=%d)", maxCGIHeaderBytes)
 		} else {
@@ -690,7 +688,6 @@ func (w *bufferedWriter) transitionState() error {
 			w.state = bsCanonicalBuffering
 			w.bodyStart = sepIdx + sepLen
 			w.headers = headers
-			w.noBody = !statusAllowsBody(status)
 
 		} else if len(data) > maxCGIHeaderBytes {
 			return fmt.Errorf("CGI response header too large (limit=%d)", maxCGIHeaderBytes)
@@ -700,23 +697,34 @@ func (w *bufferedWriter) transitionState() error {
 	}
 
 	if w.state == bsCanonicalBuffering {
-		if overThreshold {
-			// log.Printf("[%v] XXX bsCanonicalBuffering -> switch to bsStreaming", w.ctx.Value(ctxKeyID).(string))
+		if bufferOver {
 			w.applyHeaders()
-			if !statusAllowsBody(w.status) && w.buffer.Len() > w.bodyStart {
-				return fmt.Errorf("status %d must not include a response body", w.status)
+			if !statusAllowsBody(w.Status()) && w.buffer.Len() > w.bodyStart {
+				return fmt.Errorf("status %d must not include response body", w.Status())
 			}
-			return w.writeStreaming(w.status, w.buffer.Bytes()[w.bodyStart:])
+			return w.writeStreaming(w.buffer.Bytes()[w.bodyStart:])
 		}
 	}
 
 	if w.state == bsRawBuffering {
-		if overThreshold {
-			// log.Printf("[%v] XXX bsRawBuffering -> switch to bsStreaming", w.ctx.Value(ctxKeyID).(string))
-			return w.writeStreaming(http.StatusOK, w.buffer.Bytes())
+		if bufferOver {
+			return w.writeStreaming(w.buffer.Bytes())
 		}
 	}
 
+	return nil
+}
+
+func (w *bufferedWriter) writeStreaming(b []byte) error {
+	w.state = bsStreaming
+	w.WriteHeader(w.Status())
+	if len(b) > 0 {
+		if _, err := w.countingResponseWriter.Write(b); err != nil {
+			return err
+		}
+		w.countingResponseWriter.Flush()
+	}
+	w.buffer.Reset()
 	return nil
 }
 
@@ -732,22 +740,19 @@ func (w *bufferedWriter) Flush() error {
 		return w.err
 	}
 
-	if w.status == 0 {
-		w.status = http.StatusOK
-	}
 	body := w.buffer.Bytes()
 	if w.state == bsCanonicalBuffering {
 		body = w.buffer.Bytes()[w.bodyStart:]
 	}
-	if !statusAllowsBody(w.status) && len(body) > 0 {
-		w.err = fmt.Errorf("status %d must not include a response body", w.status)
+	if !statusAllowsBody(w.Status()) && len(body) > 0 {
+		w.err = fmt.Errorf("status %d must not include response body", w.Status())
 		return w.err
 	}
 	w.applyHeaders()
-	if statusAllowsBody(w.status) {
+	if statusAllowsBody(w.Status()) {
 		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	}
-	return w.writeStreaming(w.status, body)
+	return w.writeStreaming(body)
 
 }
 
@@ -757,19 +762,6 @@ func (w *bufferedWriter) applyHeaders() {
 			w.Header().Add(name, value)
 		}
 	}
-}
-
-func (w *bufferedWriter) writeStreaming(status int, b []byte) error {
-	w.state = bsStreaming
-	w.WriteHeader(status)
-	if len(b) > 0 {
-		if _, err := w.countingResponseWriter.Write(b); err != nil {
-			return err
-		}
-		w.countingResponseWriter.Flush()
-	}
-	w.buffer.Reset()
-	return nil
 }
 
 // for Stream Output
@@ -984,11 +976,7 @@ func (h *execHandler) pipeCommand(
 	}
 
 	<-copyCh
-	cmdErr := proc.Wait()
-	exited := true
-	if e, ok := cmdErr.(*exec.ExitError); ok {
-		exited = e.Exited()
-	}
+	exited, cmdErr := proc.Wait()
 
 	if copyErr.error != nil && !errors.Is(copyErr.error, os.ErrClosed) {
 		log.Printf("[%v] copy failed, reason=%v", ctx.Value(ctxKeyID).(string), copyErr.error)
@@ -1210,9 +1198,13 @@ func (p *commandProcess) Done() <-chan struct{} {
 	return p.doneCh
 }
 
-func (p *commandProcess) Wait() error {
+func (p *commandProcess) Wait() (bool, error) {
 	<-p.doneCh
-	return p.waitErr
+	exited := true
+	if e, ok := p.waitErr.(*exec.ExitError); ok {
+		exited = e.Exited()
+	}
+	return exited, p.waitErr
 }
 
 func (p *commandProcess) Stop() {
