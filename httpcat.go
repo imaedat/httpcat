@@ -36,7 +36,7 @@ const (
 	readHeaderTimeout   = 10 * time.Second
 	shutdownTimeout     = 5 * time.Second
 	defaultOutputBuffer = 1 << 20
-	maxCGIHeaderBytes   = 64 << 10
+	headerBufferLimit   = 64 << 10
 )
 
 type contextKey int
@@ -566,18 +566,14 @@ func (w *countingResponseWriter) WriteHeader(status int) {
 }
 
 func (w *countingResponseWriter) Write(b []byte) (int, error) {
-	if w.status == 0 {
-		w.WriteHeader(http.StatusOK)
-	}
+	w.WriteHeader(http.StatusOK)
 	n, err := w.ResponseWriter.Write(b)
 	w.bytes += int64(n)
 	return n, err
 }
 
 func (w *countingResponseWriter) Flush() {
-	if w.status == 0 {
-		w.WriteHeader(http.StatusOK)
-	}
+	w.WriteHeader(http.StatusOK)
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
@@ -622,13 +618,13 @@ const (
 // for Normal (Buffered) Output
 type bufferedWriter struct {
 	*countingResponseWriter
-	ctx       context.Context
-	maxBuffer int64
-	buffer    bytes.Buffer
-	err       error
-	state     bufferingState
-	bodyStart int
-	headers   http.Header
+	maxBuffer      int64
+	buffer         bytes.Buffer
+	err            error
+	state          bufferingState
+	bufferedStatus int
+	bodyStart      int
+	headers        http.Header
 }
 
 func (w *bufferedWriter) Write(p []byte) (int, error) {
@@ -671,8 +667,8 @@ func (w *bufferedWriter) transitionState() error {
 
 		} else if bufferOver {
 			return w.writeStreaming(w.buffer.Bytes())
-		} else if len(data) > maxCGIHeaderBytes {
-			return fmt.Errorf("CGI response header too large (limit=%d)", maxCGIHeaderBytes)
+		} else if len(data) > headerBufferLimit {
+			return fmt.Errorf("CGI response header too large (limit=%d)", headerBufferLimit)
 		} else {
 			return nil
 		}
@@ -684,13 +680,13 @@ func (w *bufferedWriter) transitionState() error {
 			if err != nil {
 				return err
 			}
-			w.status = status
+			w.bufferedStatus = status
 			w.state = bsCanonicalBuffering
 			w.bodyStart = sepIdx + sepLen
 			w.headers = headers
 
-		} else if len(data) > maxCGIHeaderBytes {
-			return fmt.Errorf("CGI response header too large (limit=%d)", maxCGIHeaderBytes)
+		} else if len(data) > headerBufferLimit {
+			return fmt.Errorf("CGI response header too large (limit=%d)", headerBufferLimit)
 		} else {
 			return nil
 		}
@@ -699,8 +695,8 @@ func (w *bufferedWriter) transitionState() error {
 	if w.state == bsCanonicalBuffering {
 		if bufferOver {
 			w.applyHeaders()
-			if !statusAllowsBody(w.Status()) && w.buffer.Len() > w.bodyStart {
-				return fmt.Errorf("status %d must not include response body", w.Status())
+			if !statusAllowsBody(w.bufferedStatus) && w.buffer.Len() > w.bodyStart {
+				return fmt.Errorf("status %d must not include response body", w.bufferedStatus)
 			}
 			return w.writeStreaming(w.buffer.Bytes()[w.bodyStart:])
 		}
@@ -717,7 +713,7 @@ func (w *bufferedWriter) transitionState() error {
 
 func (w *bufferedWriter) writeStreaming(b []byte) error {
 	w.state = bsStreaming
-	w.WriteHeader(w.Status())
+	w.WriteHeader(w.bufferedStatus)  // XXX
 	if len(b) > 0 {
 		if _, err := w.countingResponseWriter.Write(b); err != nil {
 			return err
@@ -744,12 +740,12 @@ func (w *bufferedWriter) Flush() error {
 	if w.state == bsCanonicalBuffering {
 		body = w.buffer.Bytes()[w.bodyStart:]
 	}
-	if !statusAllowsBody(w.Status()) && len(body) > 0 {
-		w.err = fmt.Errorf("status %d must not include response body", w.Status())
+	if !statusAllowsBody(w.bufferedStatus) && len(body) > 0 {
+		w.err = fmt.Errorf("status %d must not include response body", w.bufferedStatus)
 		return w.err
 	}
 	w.applyHeaders()
-	if statusAllowsBody(w.Status()) {
+	if statusAllowsBody(w.bufferedStatus) {
 		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	}
 	return w.writeStreaming(body)
@@ -847,7 +843,11 @@ func (h *execHandler) serve(ctx context.Context, r *http.Request, w *countingRes
 		w.Header().Set("Content-Type", "application/octet-stream")
 		respWriter = &streamWriter{countingResponseWriter: w}
 	} else {
-		respWriter = &bufferedWriter{countingResponseWriter: w, ctx: ctx, maxBuffer: h.config.maxOutputBuffer}
+		respWriter = &bufferedWriter{
+			countingResponseWriter: w,
+			maxBuffer:              h.config.maxOutputBuffer,
+			bufferedStatus:         http.StatusOK,
+		}
 	}
 
 	if err := h.pipeCommand(ctx, bodyReader, respWriter, false); err != nil {
@@ -872,7 +872,7 @@ func (h *execHandler) serveWebSocket(ctx context.Context, r *http.Request, w *co
 	if h.config.websocketMode < wsModeUpgrade {
 		return false, nil
 	}
-	status, key_or_msg := isWebSocketRequest(r)
+	status, keyOrMsg := isWebSocketRequest(r)
 	if status == 0 {
 		return false, nil
 	}
@@ -881,7 +881,7 @@ func (h *execHandler) serveWebSocket(ctx context.Context, r *http.Request, w *co
 			w.Header().Set("Sec-WebSocket-Version", "13")
 		}
 		http.Error(w, http.StatusText(status), status)
-		return true, errors.New(key_or_msg)
+		return true, errors.New(keyOrMsg)
 	}
 
 	conn, rw, err := w.Hijack()
@@ -893,7 +893,7 @@ func (h *execHandler) serveWebSocket(ctx context.Context, r *http.Request, w *co
 	conn.SetDeadline(time.Time{})
 
 	hash := sha1.New()
-	hash.Write([]byte(key_or_msg))
+	hash.Write([]byte(keyOrMsg))
 	hash.Write([]byte("258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
 	accept := base64.StdEncoding.EncodeToString(hash.Sum(nil))
 
@@ -975,24 +975,22 @@ func (h *execHandler) pipeCommand(
 		}
 	}
 
-	<-copyCh
-	exited, cmdErr := proc.Wait()
+	second := <-copyCh
+	if second.error != nil && copyErr.error == nil {
+		copyErr.error = second.error
+	}
+	_, cmdErr := proc.Wait()
 
 	if copyErr.error != nil && !errors.Is(copyErr.error, os.ErrClosed) {
-		log.Printf("[%v] copy failed, reason=%v", ctx.Value(ctxKeyID).(string), copyErr.error)
-		err = copyErr.error
+		return copyErr.error
 	}
-	if cmdErr != nil && (exited || !errors.Is(proc.ctx.Err(), context.Canceled)) {
-		// log.Printf("[%v] command failed, reason=%v", ctx.Value(ctxKeyID).(string), cmdErr)
-		if err == nil {
-			err = cmdErr
-		}
-	} else {
-		log.Printf("[%v] command completed, pid=%v, exit=%v, duration=%v, bytes_in=%v, bytes_out=%v",
-			proc.ctx.Value(ctxKeyID).(string), proc.cmd.Process.Pid, proc.exitCode, proc.duration,
-			bytesIn, bytesOut)
+	if cmdErr != nil /*&& (exited || !errors.Is(proc.ctx.Err(), context.Canceled))*/ {
+		return cmdErr
 	}
-	return err
+	log.Printf("[%v] command completed, pid=%v, exit=%v, duration=%v, bytes_in=%v, bytes_out=%v",
+		proc.ctx.Value(ctxKeyID).(string), proc.cmd.Process.Pid, proc.exitCode, proc.duration,
+		bytesIn, bytesOut)
+	return nil
 }
 
 func buildCGIEnv(r *http.Request) []string {
@@ -1097,31 +1095,31 @@ func isCGIEnvKey(key string) bool {
 
 func handleExecError(ctx context.Context, w http.ResponseWriter, err error) {
 	log.Printf("[%v] command failed, reason=%v", ctx.Value(ctxKeyID).(string), err)
-	if !errors.Is(err, context.Canceled) || ctx.Err() == nil {
-		status := http.StatusBadGateway
-		// XXX not supported Go 1.18
-		// var maxBytesError *http.MaxBytesError
-		// if errors.As(err, &maxBytesError) {
-		if strings.Contains(err.Error(), "http: request body too large") {
-			status = http.StatusRequestEntityTooLarge
-		} else if errors.Is(err, context.DeadlineExceeded) ||
-			errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			status = http.StatusGatewayTimeout
-		}
-		http.Error(w, http.StatusText(status), status)
+	//if !errors.Is(err, context.Canceled) || ctx.Err() == nil {
+	status := http.StatusBadGateway
+	// XXX not supported Go 1.18
+	// var maxBytesError *http.MaxBytesError
+	// if errors.As(err, &maxBytesError) {
+	if strings.Contains(err.Error(), "http: request body too large") {
+		status = http.StatusRequestEntityTooLarge
+	} else if errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		status = http.StatusGatewayTimeout
 	}
+	http.Error(w, http.StatusText(status), status)
+	//}
 }
 
 // Command Process
 type commandProcess struct {
-	sigCtx   context.Context
-	ctx      context.Context
-	cancel   context.CancelFunc
-	cmd      *exec.Cmd
-	doneCh   chan struct{}
-	waitErr  error
-	duration time.Duration
-	exitCode int
+	sigCtx    context.Context
+	ctx       context.Context
+	cancel    context.CancelFunc
+	cmd       *exec.Cmd
+	waitErr   error
+	startedAt time.Time
+	duration  time.Duration
+	exitCode  int
 }
 
 func newCommandProcess(ctx context.Context, cfg *config, applyTimeout bool) *commandProcess {
@@ -1148,19 +1146,14 @@ func (p *commandProcess) Start() error {
 	if err := p.cmd.Start(); err != nil {
 		return err
 	}
-	startedAt := time.Now()
+	p.startedAt = time.Now()
 	log.Printf("[%v] command started, pid=%v, cmd=%v",
 		p.ctx.Value(ctxKeyID).(string), p.cmd.Process.Pid, p.cmd.Path)
 
-	p.doneCh = make(chan struct{})
-	processDone := make(chan struct{})
-	watchDone := make(chan struct{})
 	go func() {
-		defer close(watchDone)
 		select {
 		case <-p.sigCtx.Done():
 		case <-p.ctx.Done():
-		case <-processDone:
 		}
 		if err := syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL); err != nil &&
 			!errors.Is(err, syscall.ESRCH) {
@@ -1168,43 +1161,50 @@ func (p *commandProcess) Start() error {
 		}
 	}()
 
-	go func() {
-		p.waitErr = p.cmd.Wait()
-		p.duration = time.Since(startedAt)
-		if p.waitErr == nil {
-			p.exitCode = 0
-		} else if e, ok := p.waitErr.(*exec.ExitError); ok {
-			if w, ok := e.Sys().(syscall.WaitStatus); ok {
-				if s := w.Signal(); s > 0 {
-					p.exitCode = 128 + int(s)
-				} else {
-					p.exitCode = w.ExitStatus()
-				}
-			} else {
-				p.exitCode = e.ExitCode()
-			}
-		} else {
-			p.exitCode = 1
-		}
-		close(processDone)
-		<-watchDone
-		close(p.doneCh)
-	}()
-
 	return nil
 }
 
-func (p *commandProcess) Done() <-chan struct{} {
-	return p.doneCh
+func (p *commandProcess) Wait() (bool, error) {
+	defer p.cancel()
+	waitCh := make(chan error, 1)
+	go func() {
+		waitCh <- nil
+		waitCh <- p.cmd.Wait()
+	}()
+	<-waitCh
+	select {
+	case p.waitErr = <-waitCh:
+	default:
+		p.cancel()  // XXX race
+		p.waitErr = <-waitCh
+	}
+	p.duration = time.Since(p.startedAt)
+
+	var exited bool
+	exited, p.exitCode = p.exitStatus(p.waitErr)
+	if p.ctx.Err() != nil /*&& !errors.Is(p.ctx.Err(), context.Canceled)*/ {
+		p.waitErr = p.ctx.Err()
+	}
+
+	return exited, p.waitErr
 }
 
-func (p *commandProcess) Wait() (bool, error) {
-	<-p.doneCh
-	exited := true
-	if e, ok := p.waitErr.(*exec.ExitError); ok {
-		exited = e.Exited()
+func (p *commandProcess) exitStatus(err error) (bool, int) {
+	if err == nil {
+		return true, 0
 	}
-	return exited, p.waitErr
+	if e, ok := err.(*exec.ExitError); ok {
+		if w, ok := e.Sys().(syscall.WaitStatus); ok {
+			if s := w.Signal(); s > 0 {
+				return e.Exited(), 128 + int(s)
+			} else {
+				return e.Exited(), w.ExitStatus()
+			}
+		} else {
+			return e.Exited(), e.ExitCode()
+		}
+	}
+	return true, 1
 }
 
 func (p *commandProcess) Stop() {
@@ -1216,6 +1216,25 @@ type execResponse struct {
 	status  int
 	headers http.Header
 	body    []byte
+}
+
+func takeFirstLine(data []byte) (string, []byte) {
+	lineEnd := bytes.IndexByte(data, '\n')
+	if lineEnd < 0 {
+		return strings.TrimSuffix(string(data), "\r"), nil
+	}
+	line := strings.TrimSuffix(string(data[:lineEnd]), "\r")
+	return line, data[lineEnd+1:]
+}
+
+func findHeaderSeparator(data []byte) (int, int) {
+	sepIdx, sepLen := -1, 0
+	for _, sep := range [][]byte{[]byte("\r\n\r\n"), []byte("\n\n")} {
+		if i := bytes.Index(data, sep); i >= 0 && (sepIdx < 0 || i < sepIdx) {
+			sepIdx, sepLen = i, len(sep)
+		}
+	}
+	return sepIdx, sepLen
 }
 
 func parseCGIResponseHeader(headerPart []byte) (int, http.Header, error) {
@@ -1304,16 +1323,6 @@ func parseCGIResponse(data []byte) (*execResponse, error) {
 	return &execResponse{status: status, headers: headers, body: body}, nil
 }
 
-func findHeaderSeparator(data []byte) (int, int) {
-	sepIdx, sepLen := -1, 0
-	for _, sep := range [][]byte{[]byte("\r\n\r\n"), []byte("\n\n")} {
-		if i := bytes.Index(data, sep); i >= 0 && (sepIdx < 0 || i < sepIdx) {
-			sepIdx, sepLen = i, len(sep)
-		}
-	}
-	return sepIdx, sepLen
-}
-
 func splitExecOutput(data []byte) (bool, []byte, []byte) {
 	sepIdx, sepLen := findHeaderSeparator(data)
 	if sepIdx < 0 {
@@ -1326,15 +1335,6 @@ func splitExecOutput(data []byte) (bool, []byte, []byte) {
 		return false, nil, data
 	}
 	return true, headerPart, data[sepIdx+sepLen:]
-}
-
-func takeFirstLine(data []byte) (string, []byte) {
-	lineEnd := bytes.IndexByte(data, '\n')
-	if lineEnd < 0 {
-		return strings.TrimSuffix(string(data), "\r"), nil
-	}
-	line := strings.TrimSuffix(string(data[:lineEnd]), "\r")
-	return line, data[lineEnd+1:]
 }
 
 func parseStatusCode(value string) (int, error) {
